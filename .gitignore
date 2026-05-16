@@ -1,0 +1,5 @@
+.pytest*
+.claude
+venv
+__pycache__
+*.csv
