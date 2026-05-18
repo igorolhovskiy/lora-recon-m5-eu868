@@ -15,14 +15,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import lora_recon  # needed to patch SF_DWELL
-from lora_recon import LoRaUnit, EU868_CHANNELS, SPREADING_FACTORS, PacketRecord
+from lora_recon import LoRaUnit, EU868_CHANNELS, SPREADING_FACTORS, PacketRecord, RX2_FREQ, RX2_SF
 from lora_tui import (
     HardwareScanner,
     SweepScreen,
     LockScreen,
     LoRaTUIApp,
     ALL_COMBOS,
+    SF_SENSITIVITY,
     _make_pkt,
+    _link_margin,
 )
 from textual.widgets import DataTable, Static
 
@@ -49,15 +51,16 @@ def _mock_unit(readline_lines=None):
         unit = LoRaUnit("/dev/null")
     unit.ser = mock_ser
 
-    unit.ping          = MagicMock(return_value=True)
-    unit.configure_p2p = MagicMock(return_value=True)
-    unit.start_rx      = MagicMock(return_value=True)
-    unit.stop_rx       = MagicMock(return_value=True)
-    unit.get_version   = MagicMock(return_value="TEST_FW_1.0")
-    unit.get_deveui    = MagicMock(return_value="AABBCCDDEEFF0011")
-    unit.get_nwm       = MagicMock(return_value=1)
-    unit.set_p2p_mode  = MagicMock(return_value=True)
-    unit.close         = MagicMock()
+    unit.ping             = MagicMock(return_value=True)
+    unit.configure_p2p    = MagicMock(return_value=True)
+    unit.start_rx         = MagicMock(return_value=True)
+    unit.stop_rx          = MagicMock(return_value=True)
+    unit.set_iq_inversion = MagicMock(return_value=True)
+    unit.get_version      = MagicMock(return_value="TEST_FW_1.0")
+    unit.get_deveui       = MagicMock(return_value="AABBCCDDEEFF0011")
+    unit.get_nwm          = MagicMock(return_value=1)
+    unit.set_p2p_mode     = MagicMock(return_value=True)
+    unit.close            = MagicMock()
     return unit
 
 
@@ -69,10 +72,8 @@ def _uplink_frame(dev_addr_int=0x260B1234, fcnt=7) -> str:
 
 
 def _pkt_lines(dev_addr_int=0x260B1234, fcnt=7):
-    return [
-        "+EVT:RXP2P,RSSI -90,SNR 6",
-        f"+EVT:{_uplink_frame(dev_addr_int, fcnt)}",
-    ]
+    # RUI3 v4.x single-line format
+    return [f"+EVT:RXP2P:-90:6:{_uplink_frame(dev_addr_int, fcnt)}"]
 
 
 def _make_app(readline_lines=None):
@@ -214,6 +215,94 @@ class TestHardwareScanner:
         s.stop()
         assert len(pkts) == 1
 
+    def test_sweep_checks_rx2_after_n_hops(self):
+        """With rx2_interval=1, sweep visits RX2 after the first EU868 hop."""
+        s = self._scanner()
+        s.rx2_interval = 1
+        seen = set()
+        done = threading.Event()
+
+        def on_ch(f, sf):
+            seen.add((f, sf))
+            if (RX2_FREQ, RX2_SF) in seen:
+                done.set()
+                s._stop.set()
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_sweep(on_channel=on_ch, on_packet=lambda p: None)
+            done.wait(timeout=5)
+        s.stop()
+        assert (RX2_FREQ, RX2_SF) in seen
+
+    def test_sweep_rx2_uses_downlink_iq(self):
+        """Sweep RX2 check calls set_iq_inversion(True) then restores False."""
+        s = self._scanner()
+        s.rx2_interval = 1
+        iq_calls = []
+        done = threading.Event()
+
+        def tracking_iq(inverted):
+            iq_calls.append(inverted)
+            if True in iq_calls:
+                done.set()
+                s._stop.set()
+            return True
+
+        s.unit.set_iq_inversion = tracking_iq
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_sweep(on_channel=lambda f, sf: None, on_packet=lambda p: None)
+            done.wait(timeout=5)
+        s.stop()
+        assert True in iq_calls
+
+    def test_rx2_lock_uses_downlink_iq_throughout(self):
+        """start_lock with is_downlink=True uses IQINVER=1 on every cycle."""
+        s = self._scanner()
+        iq_calls = []
+        done = threading.Event()
+
+        def tracking_iq(inverted):
+            iq_calls.append(inverted)
+            if True in iq_calls:
+                done.set()
+                s._stop.set()
+            return True
+
+        s.unit.set_iq_inversion = tracking_iq
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_lock(freq=RX2_FREQ, sf=RX2_SF, on_packet=lambda p: None,
+                         is_downlink=True)
+            done.wait(timeout=5)
+        s.stop()
+        assert iq_calls[0] is True          # first call is inverted (downlink)
+        assert True in iq_calls
+
+    def test_rx2_lock_skips_rx2_interleave(self):
+        """When already locked on RX2, no additional RX2 interleave cycles are run."""
+        s = self._scanner()
+        s.rx2_interval = 1          # interleave every cycle if it were to run
+        seen_freqs = []
+        done = threading.Event()
+
+        def tracking_configure(freq, sf):
+            seen_freqs.append(freq)
+            if len(seen_freqs) >= 3:
+                done.set()
+                s._stop.set()
+            return True
+
+        s.unit.configure_p2p = tracking_configure
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_lock(freq=RX2_FREQ, sf=RX2_SF, on_packet=lambda p: None,
+                         is_downlink=True)
+            done.wait(timeout=5)
+        s.stop()
+        # Every configure_p2p call must be for RX2_FREQ — no EU868 interleave
+        assert all(f == RX2_FREQ for f in seen_freqs)
+
 
 # ---------------------------------------------------------------------------
 # _make_pkt helper
@@ -240,6 +329,31 @@ class TestMakePkt:
 
 
 # ---------------------------------------------------------------------------
+# _link_margin helper
+# ---------------------------------------------------------------------------
+class TestLinkMargin:
+    def test_known_floor(self):
+        # SF7 floor is -123; RSSI=-90 → margin = 33
+        assert _link_margin(-90, 7) == 33
+
+    def test_sf12_floor(self):
+        # SF12 floor is -137; RX2 downlink at -80 dBm
+        assert _link_margin(-80, 12) == 57
+
+    def test_none_rssi_returns_none(self):
+        assert _link_margin(None, 9) is None
+
+    def test_all_sfs_covered(self):
+        for sf in range(7, 13):
+            assert sf in SF_SENSITIVITY
+            assert _link_margin(-100, sf) == -100 - SF_SENSITIVITY[sf]
+
+    def test_marginal_negative_margin(self):
+        # A packet decoded barely below the listed floor (firmware may still decode it)
+        assert _link_margin(-140, 12) == -3
+
+
+# ---------------------------------------------------------------------------
 # Textual headless tests (async)
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
@@ -263,7 +377,7 @@ async def test_sweep_table_has_48_rows():
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause(0.3)
         table = app.screen.query_one("#sw_table", DataTable)
-        assert table.row_count == 48
+        assert table.row_count == 49
 
 
 @pytest.mark.asyncio
@@ -272,7 +386,7 @@ async def test_sweep_table_columns():
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause(0.2)
         table = app.screen.query_one("#sw_table", DataTable)
-        assert len(table.columns) == 8
+        assert len(table.columns) == 9
 
 
 @pytest.mark.asyncio
@@ -319,7 +433,7 @@ async def test_lock_screen_shows_packet_table():
         await pilot.pause(0.2)
         table = app.screen.query_one("#pkt_table", DataTable)
         assert table is not None
-        assert len(table.columns) == 9  # +MAC Cmds column
+        assert len(table.columns) == 10  # +Margin column
 
 
 @pytest.mark.asyncio
@@ -354,6 +468,26 @@ async def test_l_key_single_lock_passes_freq_and_sf():
         freq, sf = ALL_COMBOS[3]
         assert screen._freq == freq
         assert screen._sf == sf
+        assert screen._freq_hop is False
+
+
+@pytest.mark.asyncio
+async def test_enter_on_rx2_row_enters_rx2_lock():
+    """Enter on the 49th row (RX2) opens LockScreen in downlink mode."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.click("#sw_table")
+        # Navigate to the RX2 row (index 48, one past the 48 EU868 combos)
+        for _ in range(len(ALL_COMBOS)):
+            await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, LockScreen)
+        assert screen._freq == RX2_FREQ
+        assert screen._sf == RX2_SF
+        assert screen._is_downlink is True
         assert screen._freq_hop is False
 
 
@@ -562,3 +696,126 @@ async def test_scanner_delivers_packet_to_sweep_screen():
         active = [s for s in screen._state.values() if s["pkts"] > 0]
         assert len(active) >= 1
         assert any(s["addr"] == "260B9999" for s in active)
+
+
+# ---------------------------------------------------------------------------
+# RX2 interval keybinding
+# ---------------------------------------------------------------------------
+
+def test_rx2_interval_default():
+    scanner = HardwareScanner(_mock_unit())
+    assert scanner.rx2_interval == 10
+
+
+def test_rx2_interval_cycles_through_presets():
+    scanner = HardwareScanner(_mock_unit())
+    presets = HardwareScanner.RX2_PRESETS
+    scanner.rx2_interval = presets[0]
+    for expected in presets[1:] + [presets[0]]:
+        cur = scanner.rx2_interval
+        nxt = presets[(presets.index(cur) + 1) % len(presets)]
+        scanner.rx2_interval = nxt
+        assert scanner.rx2_interval == expected
+
+
+async def test_i_key_cycles_rx2_interval_on_sweep_screen():
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, SweepScreen)
+        before = app._scanner.rx2_interval
+        await pilot.press("i")
+        await pilot.pause(0.1)
+        after = app._scanner.rx2_interval
+        assert after != before
+        assert after in HardwareScanner.RX2_PRESETS
+
+
+async def test_i_key_cycles_rx2_interval_on_lock_screen():
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.click("#sw_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, LockScreen)
+        app._scanner.stop()
+        before = app._scanner.rx2_interval
+        await pilot.press("i")
+        await pilot.pause(0.1)
+        after = app._scanner.rx2_interval
+        assert after != before
+        assert after in HardwareScanner.RX2_PRESETS
+
+
+async def test_rx2_interval_shared_between_screens():
+    """Interval set on sweep screen persists when entering lock screen."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        # Set to first preset on sweep screen
+        app._scanner.rx2_interval = HardwareScanner.RX2_PRESETS[0]
+        await pilot.click("#sw_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, LockScreen)
+        assert app._scanner.rx2_interval == HardwareScanner.RX2_PRESETS[0]
+
+
+# ---------------------------------------------------------------------------
+# Link margin in UI
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_sweep_packet_state_stores_margin():
+    """_on_packet on SweepScreen populates the margin field in _state."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, SweepScreen)
+        app._scanner.stop()
+        pkt = _make_pkt({"rssi": -90, "snr": 6, "raw_hex": ""}, 868100000, 7)
+        screen._on_packet(pkt)
+        await pilot.pause(0.1)
+        state = screen._state[(868100000, 7)]
+        assert state["margin"] == 33   # -90 - (-123) = 33
+
+
+@pytest.mark.asyncio
+async def test_lock_packet_row_includes_margin():
+    """_on_packet on LockScreen adds a row that contains the margin string."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.click("#sw_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, LockScreen)
+        app._scanner.stop()
+        # RSSI=-80, SF=12 → margin = -80 - (-137) = +57
+        pkt = _make_pkt({"rssi": -80, "snr": 5, "raw_hex": ""}, 869525000, 12, is_downlink=True)
+        screen._on_packet(pkt)
+        await pilot.pause(0.1)
+        t = screen.query_one("#pkt_table", DataTable)
+        assert t.row_count == 1
+
+
+@pytest.mark.asyncio
+async def test_rx2_packet_appears_in_sweep_table():
+    """RX2 downlink delivered via _on_packet is stored in the 869.525/SF12 state."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, SweepScreen)
+        app._scanner.stop()
+        pkt = _make_pkt({"rssi": -95, "snr": 4, "raw_hex": ""}, RX2_FREQ, RX2_SF, is_downlink=True)
+        screen._on_packet(pkt)
+        await pilot.pause(0.1)
+        state = screen._state[(RX2_FREQ, RX2_SF)]
+        assert state["pkts"] == 1
+        assert state["rssi"] == -95
+        assert state["margin"] == -95 - (-137)  # +42 dB

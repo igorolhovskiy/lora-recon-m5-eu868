@@ -20,6 +20,10 @@ Key commands used:
   AT+PCR=<0-3>      → coding rate (0=4/5, 1=4/6, 2=4/7, 3=4/8)
   AT+PPL=8          → preamble length
   AT+PRECV=<ms>     → open RX window; 65534 = continuous until packet or timeout
+  AT+SYNCWORD=3444  → LoRaWAN public sync word (default 0x1234 drops all LoRaWAN frames)
+  AT+IQINVER=0/1   → IQ polarity: 0=normal (uplinks), 1=inverted (RX2 downlinks)
+Async events (RUI3 v4.x single-line format):
+  +EVT:RXP2P:<RSSI>:<SNR>:<hex payload>
   AT+RSSI=?         → last packet RSSI
   AT+SNR=?          → last packet SNR
 Async events from module:
@@ -366,14 +370,22 @@ class LoRaUnit:
 
     def set_p2p_mode(self) -> bool:
         """Switch to raw LoRa P2P mode (AT+NWM=0). Module may reboot."""
-        if self.get_nwm() == 0:
-            self.log.info("Already in P2P mode.")
-            return True
-        self.log.info("Switching to P2P mode...")
-        self.ser.write(b"AT+NWM=0\r\n")
-        time.sleep(2.0)
-        self.ser.reset_input_buffer()
-        return self.ping()
+        if self.get_nwm() != 0:
+            self.log.info("Switching to P2P mode...")
+            self.ser.write(b"AT+NWM=0\r\n")
+            time.sleep(2.0)
+            self.ser.reset_input_buffer()
+            if not self.ping():
+                return False
+        # Default P2P sync word (0x1234) and IQ polarity silently discard all
+        # LoRaWAN frames at the SX1262 correlator before firmware sees them.
+        ok = self.cmd_ok("AT+SYNCWORD=3444")   # LoRaWAN public network sync word
+        ok = ok and self.cmd_ok("AT+IQINVER=0") # normal IQ for uplinks (default)
+        return ok
+
+    def set_iq_inversion(self, inverted: bool) -> bool:
+        """Set IQ polarity. Uplinks use normal (False); RX2 downlinks use inverted (True)."""
+        return self.cmd_ok(f"AT+IQINVER={1 if inverted else 0}")
 
     def configure_p2p(self, freq: int, sf: int, bw: int = 125,
                        cr: int = 0, preamble: int = 8) -> bool:
@@ -386,7 +398,10 @@ class LoRaUnit:
         return self.cmd_ok(cmd)
 
     def start_rx(self, window_ms: int = 65534) -> bool:
-        """Open P2P receive window. 65534 = continuous until packet."""
+        """Open P2P receive window.
+        65534 = continuous; device listens until a packet arrives or stop_rx() is called.
+        Arbitrary ms values exist in the AT spec but are unreliable on RUI3 v4.x —
+        always pass the default (65534) and control dwell time via stop_rx()."""
         return self.cmd_ok(f"AT+PRECV={window_ms}")
 
     def stop_rx(self) -> bool:
@@ -430,15 +445,15 @@ class LoRaUnit:
 def parse_events(lines: list[str]) -> list[dict]:
     """
     Parse async UART lines for P2P receive events.
-    RAK3172 P2P RX produces two lines:
+
+    RUI3 v4.x (current) — single-line format:
+      +EVT:RXP2P:<RSSI>:<SNR>:<hex payload>
+
+    Legacy format (older firmware) — two lines:
       +EVT:RXP2P,RSSI <x>,SNR <y>
       +EVT:<hex data>
 
-    Handles edge cases:
-      - extra lines between signal and payload lines
-      - payload line appearing before signal line (reordering)
-      - multiple events in one batch
-      - orphan payload lines (no preceding signal line)
+    Both formats are handled. Multiple events per batch are supported.
     """
     results = []
     # First pass: index all signal lines and payload lines
@@ -446,6 +461,16 @@ def parse_events(lines: list[str]) -> list[dict]:
     payload_lines = {}  # index → raw_hex
 
     for i, line in enumerate(lines):
+        # RUI3 v4.x single-line: +EVT:RXP2P:<RSSI>:<SNR>:<HEX>
+        m = re.match(r'\+EVT:RXP2P:(-?\d+):(-?\d+):([0-9A-Fa-f]+)$', line.strip(), re.I)
+        if m:
+            results.append({
+                "rssi": int(m.group(1)),
+                "snr":  int(m.group(2)),
+                "raw_hex": m.group(3).upper(),
+            })
+            continue
+        # Legacy two-line signal header: +EVT:RXP2P,RSSI <x>,SNR <y>
         m = re.match(r'\+EVT:RXP2P,RSSI\s*(-?\d+),SNR\s*(-?\d+)', line, re.I)
         if m:
             signal_lines[i] = (int(m.group(1)), int(m.group(2)))
@@ -454,14 +479,13 @@ def parse_events(lines: list[str]) -> list[dict]:
         if m2:
             payload_lines[i] = m2.group(1).upper()
 
-    # Match each signal line with the nearest subsequent payload line
+    # Match each legacy signal line with the nearest subsequent payload line
     used_payloads = set()
     sorted_signals = sorted(signal_lines.keys())
     sorted_payloads = sorted(payload_lines.keys())
 
     for sig_idx in sorted_signals:
         rssi, snr = signal_lines[sig_idx]
-        # Find closest payload after this signal that hasn't been claimed
         best = None
         for pay_idx in sorted_payloads:
             if pay_idx > sig_idx and pay_idx not in used_payloads:
@@ -473,7 +497,7 @@ def parse_events(lines: list[str]) -> list[dict]:
             used_payloads.add(best)
         results.append({"rssi": rssi, "snr": snr, "raw_hex": raw_hex})
 
-    # Orphan payload lines (payload without a preceding signal)
+    # Orphan legacy payload lines (payload without a preceding signal)
     for pay_idx in sorted_payloads:
         if pay_idx not in used_payloads:
             results.append({"rssi": None, "snr": None, "raw_hex": payload_lines[pay_idx]})
@@ -676,8 +700,7 @@ class SweepScanner:
         if not self.unit.configure_p2p(freq, sf):
             self.log.warning(f"Failed to configure {freq} SF{sf}")
             return
-        window_ms = int(dwell * 1000)
-        self.unit.start_rx(window_ms)
+        self.unit.start_rx()
         lines = self.unit.read_async_events(dwell + 0.5)
         self.unit.stop_rx()
 
@@ -695,10 +718,12 @@ class SweepScanner:
         self.output.info(f"RX2 check: {RX2_FREQ/1e6:.3f} MHz SF{RX2_SF}")
         if not self.unit.configure_p2p(RX2_FREQ, RX2_SF):
             return
+        self.unit.set_iq_inversion(True)   # downlinks use inverted IQ
         dwell = SF_DWELL[RX2_SF]
-        self.unit.start_rx(int(dwell * 1000))
+        self.unit.start_rx()
         lines = self.unit.read_async_events(dwell + 0.5)
         self.unit.stop_rx()
+        self.unit.set_iq_inversion(False)  # restore normal IQ for uplinks
         for pkt_dict in parse_events(lines):
             pkt = self._make_record(pkt_dict, RX2_FREQ, RX2_SF, is_downlink=True)
             self.output.record(pkt)
@@ -784,7 +809,7 @@ class LockMonitor:
                 return
             dwell = SF_DWELL[self.sf]
             self.unit.configure_p2p(freq, self.sf)
-            self.unit.start_rx(int(dwell * 1000))
+            self.unit.start_rx()
             lines = self.unit.read_async_events(dwell + 0.5)
             self.unit.stop_rx()
             for pkt_dict in parse_events(lines):
@@ -805,10 +830,12 @@ class LockMonitor:
     def _check_rx2(self):
         self.output.info(f"RX2 interleave check: {RX2_FREQ/1e6:.3f} MHz SF{RX2_SF}")
         self.unit.configure_p2p(RX2_FREQ, RX2_SF)
+        self.unit.set_iq_inversion(True)   # downlinks use inverted IQ
         dwell = SF_DWELL[RX2_SF]
-        self.unit.start_rx(int(dwell * 1000))
+        self.unit.start_rx()
         lines = self.unit.read_async_events(dwell + 0.5)
         self.unit.stop_rx()
+        self.unit.set_iq_inversion(False)  # restore normal IQ for uplinks
         for pkt_dict in parse_events(lines):
             pkt = SweepScanner._make_record(pkt_dict, RX2_FREQ, RX2_SF, is_downlink=True)
             self.output.record(pkt)

@@ -252,9 +252,46 @@ class TestParseEvents:
         results = parse_events(lines)
         # First signal gets first available payload, second signal gets second
         assert len(results) == 2
-        hexes = {r["raw_hex"] for r in results}
-        assert "AAAA1111" in hexes
-        assert "BBBB2222" in hexes
+
+    # --- RUI3 v4.x single-line format tests ---
+
+    def test_single_line_format(self):
+        lines = ["+EVT:RXP2P:-107:-3:DEADBEEF1234"]
+        results = parse_events(lines)
+        assert len(results) == 1
+        assert results[0]["rssi"] == -107
+        assert results[0]["snr"] == -3
+        assert results[0]["raw_hex"] == "DEADBEEF1234"
+
+    def test_single_line_positive_snr(self):
+        lines = ["+EVT:RXP2P:-85:7:AABBCCDD"]
+        results = parse_events(lines)
+        assert results[0]["rssi"] == -85
+        assert results[0]["snr"] == 7
+        assert results[0]["raw_hex"] == "AABBCCDD"
+
+    def test_single_line_multiple_events(self):
+        lines = [
+            "+EVT:RXP2P:-90:5:AABBCCDD",
+            "+EVT:RXP2P:-80:9:11223344",
+        ]
+        results = parse_events(lines)
+        assert len(results) == 2
+        assert results[0]["rssi"] == -90
+        assert results[0]["raw_hex"] == "AABBCCDD"
+        assert results[1]["rssi"] == -80
+        assert results[1]["raw_hex"] == "11223344"
+
+    def test_single_line_mixed_with_noise(self):
+        lines = ["OK", "+EVT:RXP2P:-95:4:CAFEBABE", "some noise"]
+        results = parse_events(lines)
+        assert len(results) == 1
+        assert results[0]["raw_hex"] == "CAFEBABE"
+
+    def test_single_line_hex_case_normalised(self):
+        lines = ["+EVT:RXP2P:-80:6:cafebabe"]
+        results = parse_events(lines)
+        assert results[0]["raw_hex"] == "CAFEBABE"
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +399,39 @@ class TestLoRaUnit:
         unit = self._make_unit(["AT_ERROR"])
         assert unit.ping() is False
 
+    def test_set_p2p_mode_already_p2p_sets_syncword_and_iq(self):
+        # NWM=0 already; OK for SYNCWORD; OK for IQINVER
+        unit = self._make_unit(["AT+NWM=0", "OK", "OK", "OK"])
+        result = unit.set_p2p_mode()
+        assert result is True
+        written = b"".join(c[0][0] for c in unit.ser.write.call_args_list)
+        assert b"AT+NWM=?" in written
+        assert b"AT+SYNCWORD=3444" in written
+        assert b"AT+IQINVER=0" in written
+        assert b"AT+NWM=0\r\n" not in written  # no mode switch when already P2P
+
+    def test_set_p2p_mode_switches_and_sets_syncword_and_iq(self):
+        # NWM=1 → switch; ping OK; SYNCWORD OK; IQINVER OK
+        unit = self._make_unit(["AT+NWM=1", "OK", "AT", "OK", "OK", "OK"])
+        result = unit.set_p2p_mode()
+        assert result is True
+        written = b"".join(c[0][0] for c in unit.ser.write.call_args_list)
+        assert b"AT+NWM=0\r\n" in written
+        assert b"AT+SYNCWORD=3444" in written
+        assert b"AT+IQINVER=0" in written
+
+    def test_set_iq_inversion_normal(self):
+        unit = self._make_unit(["OK"])
+        assert unit.set_iq_inversion(False) is True
+        written = b"".join(c[0][0] for c in unit.ser.write.call_args_list)
+        assert b"AT+IQINVER=0" in written
+
+    def test_set_iq_inversion_inverted(self):
+        unit = self._make_unit(["OK"])
+        assert unit.set_iq_inversion(True) is True
+        written = b"".join(c[0][0] for c in unit.ser.write.call_args_list)
+        assert b"AT+IQINVER=1" in written
+
     def test_configure_p2p(self):
         unit = self._make_unit(["OK"])
         assert unit.configure_p2p(868100000, 7) is True
@@ -424,10 +494,8 @@ class TestSweepScanner:
             dev_addr = struct.pack("<I", 0x260B1234)
             frame = bytes([0x40]) + dev_addr + bytes([0x00, 0x01, 0x00, 0xAA, 0xBB])
             hex_payload = frame.hex().upper()
-            evt_lines = [
-                "+EVT:RXP2P,RSSI -90,SNR 6",
-                f"+EVT:{hex_payload}",
-            ]
+            # RUI3 v4.x single-line format
+            evt_lines = [f"+EVT:RXP2P:-90:6:{hex_payload}"]
             unit.read_async_events.return_value = evt_lines
         else:
             unit.read_async_events.return_value = []
@@ -471,6 +539,17 @@ class TestSweepScanner:
                  if c[0][0] == RX2_FREQ]
         assert len(calls) > 0
 
+    def test_rx2_check_toggles_iq(self):
+        scanner, unit, output = self._make_scanner(packets_per_hop=0)
+        scanner.rx2_interval = 1
+        scanner.run()
+        iq_calls = [c[0][0] for c in unit.set_iq_inversion.call_args_list]
+        # Must have at least one True (inverted for RX2) followed by False (restored)
+        assert True in iq_calls
+        assert False in iq_calls
+        # Last IQ call must restore normal polarity
+        assert iq_calls[-1] is False
+
     def test_dedup_prevents_double_record(self):
         scanner, unit, output = self._make_scanner(packets_per_hop=1)
         # Pre-fill dedup cache so the packet is "already seen"
@@ -497,9 +576,9 @@ class TestLockMonitor:
             dev_addr = struct.pack("<I", 0x260B1234)
             frame = bytes([0x40]) + dev_addr + bytes([0x00, 0x05, 0x00, 0xAA])
             hex_payload = frame.hex().upper()
+            # RUI3 v4.x single-line format
             unit.read_async_events.return_value = [
-                "+EVT:RXP2P,RSSI -85,SNR 7",
-                f"+EVT:{hex_payload}",
+                f"+EVT:RXP2P:-85:7:{hex_payload}",
             ]
         else:
             unit.read_async_events.return_value = []
@@ -562,6 +641,15 @@ class TestLockMonitor:
                 freq=None, sf=7, freq_hop=False,
             )
 
+    def test_rx2_interleave_toggles_iq(self):
+        monitor, unit, output = self._make_monitor()
+        monitor.rx2_interval = 1   # trigger RX2 on every cycle
+        monitor.run()
+        iq_calls = [c[0][0] for c in unit.set_iq_inversion.call_args_list]
+        assert True in iq_calls
+        assert False in iq_calls
+        assert iq_calls[-1] is False  # always restored to normal after RX2
+
 
 # ---------------------------------------------------------------------------
 # auto_detect_port
@@ -600,10 +688,8 @@ class TestPipeline:
         frame = bytes([0x80]) + dev_addr + bytes([0x80, 0x03, 0x00, 0xCC, 0xDD])
         hex_payload = frame.hex().upper()
 
-        lines = [
-            "+EVT:RXP2P,RSSI -95,SNR 4",
-            f"+EVT:{hex_payload}",
-        ]
+        # RUI3 v4.x single-line format
+        lines = [f"+EVT:RXP2P:-95:4:{hex_payload}"]
         events = parse_events(lines)
         assert len(events) == 1
         lw = parse_lorawan(events[0]["raw_hex"])

@@ -70,7 +70,7 @@ python lora_recon.py --lock-freq 868100000 --lock-sf 7 --freq-hop --lock-duratio
 
 ### Two-phase operation
 
-**Phase 1 — Sweep**: Cycles all 48 EU868 channel × SF combinations (8 channels × SF 7–12). Every N hops it briefly parks on the RX2 downlink channel (869.525 MHz / SF12) to detect gateway traffic. Any combo that receives a packet is flagged active and queued for Phase 2.
+**Phase 1 — Sweep**: Cycles all 48 EU868 channel × SF combinations (8 channels × SF 7–12). Every N hops it briefly parks on the RX2 downlink channel (869.525 MHz / SF12, IQ-inverted) to detect gateway traffic. Any combo that receives a packet is flagged active and queued for Phase 2. The TUI sweep behaves identically — the RX2 row at the bottom of the sweep table lights up when a downlink is received.
 
 **Phase 2 — Lock**: Two modes are available:
 
@@ -104,7 +104,7 @@ python lora_tui.py [--port /dev/ttyUSB0] [--baudrate 115200]
 
 ### Sweep screen
 
-Launches immediately. Shows a live 48-row table (one row per frequency × SF combination).
+Launches immediately. Shows a 49-row table: 48 EU868 uplink combinations (8 channels × SF7–SF12) plus a dedicated **869.525 MHz / SF12 (RX2)** row at the bottom.
 
 ![Sweep screen](screenshots/sweep.svg)
 
@@ -112,12 +112,15 @@ Launches immediately. Shows a live 48-row table (one row per frequency × SF com
 |---|---|
 | Freq MHz | Channel frequency |
 | SF | Spreading factor (SF7–SF12) |
-| Status | `>> scanning` / `✓  active` / `·  idle` |
+| Status | `>> scanning` / `✓  active` / `·  idle` / `·  RX2` |
 | Pkts | Packets received on this combo |
 | RSSI dBm | Signal strength of most recent packet |
 | SNR dB | Signal-to-noise ratio |
+| Margin | Link margin — RSSI minus the SF sensitivity floor (see [Link margin](#link-margin)) |
 | DevAddr | Device address (or JoinEUI for join requests) |
 | Last seen | Timestamp of most recent packet |
+
+The sweep checks the RX2 channel (IQINVER=1, correct polarity for downlinks) every N hops, where N is the RX2 interval. Gateway downlinks appear in the RX2 row. Press `I` to cycle the interval.
 
 **Controls:**
 
@@ -126,6 +129,7 @@ Launches immediately. Shows a live 48-row table (one row per frequency × SF com
 | ↑ / ↓ | Navigate rows |
 | Enter | **SF-hop lock** — fix SF from selected row, hop all 8 EU868 channels |
 | L | **Single lock** — fix both frequency and SF from selected row |
+| I | Cycle RX2 check interval (1 / 2 / 5 / 10 / 20 hops) |
 | R | Reset all statistics |
 | Q | Quit |
 
@@ -148,6 +152,7 @@ Fixes both the frequency and SF. Useful when you want to deep-monitor a specific
 | Time UTC | Packet receive time |
 | RSSI | Signal strength (dBm) |
 | SNR | Signal-to-noise ratio (dB) |
+| Margin | Link margin in dB — see [Link margin](#link-margin) |
 | Type | LoRaWAN message type |
 | DevAddr | Device address (or JoinEUI) |
 | FCnt | Frame counter — gaps indicate missed packets |
@@ -159,6 +164,7 @@ Fixes both the frequency and SF. Useful when you want to deep-monitor a specific
 
 | Key | Action |
 |---|---|
+| I | Cycle RX2 check interval (1 / 2 / 5 / 10 / 20 hops) |
 | Esc | Return to sweep screen |
 | Q | Quit |
 
@@ -213,9 +219,34 @@ In LoRaWAN 1.0.x networks, MAC commands piggybacked in the frame header (`FOpts`
 
 > **Note:** LoRaWAN 1.1 networks encrypt FOpts. On those networks the `MAC Cmds` column will show garbage bytes rather than meaningful commands.
 
+### Link margin
+
+The **Margin** column shows how many dB above the receiver's sensitivity floor the packet arrived:
+
+```
+Margin = RSSI − sensitivity_floor(SF)
+```
+
+Sensitivity floors (SX1262, BW=125 kHz, CR=4/5):
+
+| SF | Floor |
+|---|---|
+| SF7 | −123 dBm |
+| SF8 | −126 dBm |
+| SF9 | −129 dBm |
+| SF10 | −132 dBm |
+| SF11 | −135 dBm |
+| SF12 | −137 dBm |
+
+A margin of +40 dB or more suggests a nearby or high-power device. A margin of +5 dB means the link is at the edge of coverage.
+
+**Why not distance?** Converting RSSI to distance requires knowing the device's transmit power (0–14 dBm, set by ADR — unreadable without decrypting the session), the path loss exponent (2–6 depending on environment), and antenna gains. These are all unknown in a passive recon context. The same RSSI value can represent 100 m in open terrain or 5 km in dense urban cover. Margin is honest; a distance figure would not be.
+
 ### RX2 downlink activity
 
 A packet captured on 869.525 MHz / SF12 is a confirmed downlink from a LoRaWAN gateway. Seeing downlinks means a gateway is within RF range even if you have not yet caught any uplinks.
+
+The RX2 channel requires **inverted IQ polarity** (IQINVER=1). Both the sweep loop and the lock monitor set this automatically before opening the RX2 window and restore it afterward. Locking directly on 869.525 MHz via `--lock-freq` leaves IQ in uplink mode (IQINVER=0) and will not capture downlinks — use `--rx2-interval 1` with any short-dwell uplink channel instead.
 
 ### ETSI EN 300.220 frequency compliance
 

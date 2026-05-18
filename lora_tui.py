@@ -41,6 +41,18 @@ ALL_COMBOS: list[tuple[int, int]] = [
     (freq, sf) for freq in EU868_CHANNELS for sf in SPREADING_FACTORS
 ]
 
+# SX1262 receiver sensitivity floor (dBm) at BW=125 kHz, CR=4/5 per SF.
+# Link margin = RSSI − floor: how many dB above the noise floor the packet arrived.
+# Positive margin means reliably decoded; ≥30 dB suggests a nearby or high-power device.
+SF_SENSITIVITY = {7: -123, 8: -126, 9: -129, 10: -132, 11: -135, 12: -137}
+
+
+def _link_margin(rssi: Optional[int], sf: int) -> Optional[int]:
+    """Return RSSI minus the SF sensitivity floor, or None if RSSI is unknown."""
+    if rssi is None:
+        return None
+    return rssi - SF_SENSITIVITY[sf]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -73,10 +85,11 @@ class HardwareScanner:
     """Thin hardware scanner with callbacks. All callbacks are called from the
     background thread — callers must use call_from_thread() to touch the UI."""
 
-    RX2_INTERVAL = 10  # check RX2 downlink channel every N lock cycles
+    RX2_PRESETS  = [1, 2, 5, 10, 20]  # available RX2 check intervals (hops)
 
     def __init__(self, unit: LoRaUnit):
         self.unit = unit
+        self.rx2_interval = 10         # check RX2 downlink channel every N lock cycles
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -104,11 +117,12 @@ class HardwareScanner:
         self._thread.start()
 
     def start_lock(self, freq: Optional[int], sf: int, on_packet: Callable,
-                   freq_hop: bool = False, on_channel: Optional[Callable] = None):
+                   freq_hop: bool = False, on_channel: Optional[Callable] = None,
+                   is_downlink: bool = False):
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._lock_loop,
-            args=(freq, sf, on_packet, freq_hop, on_channel),
+            args=(freq, sf, on_packet, freq_hop, on_channel, is_downlink),
             daemon=True,
             name="lora-lock",
         )
@@ -118,16 +132,22 @@ class HardwareScanner:
 
     def _sweep_loop(self, on_channel: Callable, on_packet: Callable):
         dedup = DeduplicationCache()
+        hop = 0
         while not self._stop.is_set():
             for freq, sf in ALL_COMBOS:
                 if self._stop.is_set():
                     return
                 on_channel(freq, sf)
                 self._do_rx(freq, sf, on_packet, dedup)
+                hop += 1
+                if hop % self.rx2_interval == 0 and not self._stop.is_set():
+                    on_channel(RX2_FREQ, RX2_SF)
+                    self._do_rx(RX2_FREQ, RX2_SF, on_packet, dedup, is_downlink=True)
             dedup.purge()
 
     def _lock_loop(self, freq: Optional[int], sf: int, on_packet: Callable,
-                   freq_hop: bool = False, on_channel: Optional[Callable] = None):
+                   freq_hop: bool = False, on_channel: Optional[Callable] = None,
+                   is_downlink: bool = False):
         dedup = DeduplicationCache()
         cycle = 0
         while not self._stop.is_set():
@@ -137,9 +157,10 @@ class HardwareScanner:
                     return
                 if on_channel:
                     on_channel(ch, sf)
-                self._do_rx(ch, sf, on_packet, dedup)
+                self._do_rx(ch, sf, on_packet, dedup, is_downlink=is_downlink)
             cycle += 1
-            if cycle % self.RX2_INTERVAL == 0:
+            # Skip RX2 interleave when the main lock is already on RX2
+            if not is_downlink and cycle % self.rx2_interval == 0:
                 if on_channel:
                     on_channel(RX2_FREQ, RX2_SF)
                 self._do_rx(RX2_FREQ, RX2_SF, on_packet, dedup, is_downlink=True)
@@ -151,7 +172,8 @@ class HardwareScanner:
         dwell = SF_DWELL[sf]
         if not self.unit.configure_p2p(freq, sf):
             return
-        self.unit.start_rx(int(dwell * 1000))
+        self.unit.set_iq_inversion(is_downlink)  # downlinks need inverted IQ
+        self.unit.start_rx()                      # continuous (65534); stop_rx() ends the window
         # Read in 0.2 s increments so stop_event is checked every tick
         lines: list[str] = []
         deadline = time.monotonic() + dwell + 0.5
@@ -194,9 +216,10 @@ class SweepScreen(Screen):
     """
 
     BINDINGS = [
-        Binding("r", "reset",       "Reset stats",  show=True),
-        Binding("l", "lock_single", "Lock freq+SF", show=True),
-        Binding("q", "app.quit",    "Quit",         show=True),
+        Binding("r", "reset",            "Reset stats",    show=True),
+        Binding("l", "lock_single",      "Lock freq+SF",   show=True),
+        Binding("i", "cycle_rx2",        "RX2 interval",   show=True),
+        Binding("q", "app.quit",         "Quit",           show=True),
     ]
 
     def __init__(self, scanner: HardwareScanner, device_info: str):
@@ -204,8 +227,8 @@ class SweepScreen(Screen):
         self._scanner = scanner
         self._device_info = device_info
         self._state: dict[tuple, dict] = {
-            combo: {"pkts": 0, "rssi": None, "snr": None, "addr": "", "ts": ""}
-            for combo in ALL_COMBOS
+            combo: {"pkts": 0, "rssi": None, "snr": None, "margin": None, "addr": "", "ts": ""}
+            for combo in [*ALL_COMBOS, (RX2_FREQ, RX2_SF)]
         }
         self._current: Optional[tuple] = None
         self._pass_num = 0
@@ -224,14 +247,20 @@ class SweepScreen(Screen):
         t.add_column("Pkts",      width=5,  key="pkts")
         t.add_column("RSSI dBm",  width=9,  key="rssi")
         t.add_column("SNR dB",    width=7,  key="snr")
+        t.add_column("Margin",    width=8,  key="margin")
         t.add_column("DevAddr",   width=10, key="addr")
         t.add_column("Last seen", width=10, key="ts")
         for freq, sf in ALL_COMBOS:
             t.add_row(
                 f"{freq/1e6:.3f}", f"SF{sf}",
-                "·  idle", "0", "", "", "", "",
+                "·  idle", "0", "", "", "", "", "",
                 key=f"{freq}_{sf}",
             )
+        t.add_row(
+            f"{RX2_FREQ/1e6:.3f}", f"SF{RX2_SF}",
+            "·  RX2", "0", "", "", "", "", "",
+            key=f"{RX2_FREQ}_{RX2_SF}",
+        )
 
     def on_show(self) -> None:
         if not self._scanner.is_running():
@@ -260,6 +289,7 @@ class SweepScreen(Screen):
         status_bar.update(
             f"{self._device_info}  |  Pass #{self._pass_num}  "
             f"| {freq/1e6:.3f} MHz SF{sf}  dwell={SF_DWELL[sf]}s"
+            f"  |  RX2 every {self._scanner.rx2_interval} hops  [I]"
         )
 
     def _on_packet(self, pkt: PacketRecord) -> None:
@@ -267,11 +297,12 @@ class SweepScreen(Screen):
         if combo not in self._state:
             return
         s = self._state[combo]
-        s["pkts"] += 1
-        s["rssi"] = pkt.rssi
-        s["snr"]  = pkt.snr
-        s["addr"] = pkt.dev_addr or pkt.join_eui or "?"
-        s["ts"]   = pkt.timestamp[-9:]  # HH:MM:SSZ
+        s["pkts"]   += 1
+        s["rssi"]   = pkt.rssi
+        s["snr"]    = pkt.snr
+        s["margin"] = _link_margin(pkt.rssi, pkt.sf)
+        s["addr"]   = pkt.dev_addr or pkt.join_eui or "?"
+        s["ts"]     = pkt.timestamp[11:19]  # HH:MM:SS
         self._refresh_row(combo)
 
     def _refresh_row(self, combo: tuple) -> None:
@@ -286,40 +317,55 @@ class SweepScreen(Screen):
             status = ">> scanning"
         elif s["pkts"] > 0:
             status = "✓  active"
+        elif combo == (RX2_FREQ, RX2_SF):
+            status = "·  RX2"
         else:
             status = "·  idle"
+        m = s["margin"]
         t.update_cell(f"{freq}_{sf}", "status", status)
         t.update_cell(f"{freq}_{sf}", "pkts",   str(s["pkts"]))
         t.update_cell(f"{freq}_{sf}", "rssi",   f"{s['rssi']}" if s["rssi"] is not None else "")
         t.update_cell(f"{freq}_{sf}", "snr",    f"{s['snr']}"  if s["snr"]  is not None else "")
+        t.update_cell(f"{freq}_{sf}", "margin", f"{m:+d} dB"   if m is not None else "")
         t.update_cell(f"{freq}_{sf}", "addr",   s["addr"])
         t.update_cell(f"{freq}_{sf}", "ts",     s["ts"])
 
     # ---- event handlers ----------------------------------------------------
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Enter — SF-locked frequency hop (follows channel hopping across all 8 channels)."""
+        """Enter on EU868 row: SF-hop lock.  Enter on RX2 row: downlink lock."""
         idx = event.cursor_row
-        if 0 <= idx < len(ALL_COMBOS):
+        self._scanner.stop()
+        if idx == len(ALL_COMBOS):   # RX2 row
+            self.app.push_screen(LockScreen(self._scanner, RX2_FREQ, RX2_SF, is_downlink=True))
+        elif 0 <= idx < len(ALL_COMBOS):
             freq, sf = ALL_COMBOS[idx]
-            self._scanner.stop()
             self.app.push_screen(LockScreen(self._scanner, freq, sf, freq_hop=True))
 
     # ---- actions -----------------------------------------------------------
 
     def action_lock_single(self) -> None:
-        """L — single channel+SF lock (fixed freq, fixed SF)."""
+        """L on EU868 row: single-channel lock.  L on RX2 row: downlink lock."""
         t = self.query_one("#sw_table", DataTable)
         idx = t.cursor_row
-        if 0 <= idx < len(ALL_COMBOS):
+        self._scanner.stop()
+        if idx == len(ALL_COMBOS):   # RX2 row
+            self.app.push_screen(LockScreen(self._scanner, RX2_FREQ, RX2_SF, is_downlink=True))
+        elif 0 <= idx < len(ALL_COMBOS):
             freq, sf = ALL_COMBOS[idx]
-            self._scanner.stop()
             self.app.push_screen(LockScreen(self._scanner, freq, sf, freq_hop=False))
+
+    def action_cycle_rx2(self) -> None:
+        presets = HardwareScanner.RX2_PRESETS
+        cur = self._scanner.rx2_interval
+        nxt = presets[(presets.index(cur) + 1) % len(presets)] if cur in presets else presets[0]
+        self._scanner.rx2_interval = nxt
+        self.notify(f"RX2 check every {nxt} hops", timeout=2)
 
     def action_reset(self) -> None:
         self._current = None
         for combo in self._state:
-            self._state[combo] = {"pkts": 0, "rssi": None, "snr": None, "addr": "", "ts": ""}
+            self._state[combo] = {"pkts": 0, "rssi": None, "snr": None, "margin": None, "addr": "", "ts": ""}
             self._refresh_row(combo)
 
 
@@ -356,16 +402,19 @@ class LockScreen(Screen):
     """
 
     BINDINGS = [
-        Binding("escape", "back",    "Back to sweep", show=True),
-        Binding("q",      "app.quit","Quit",          show=True),
+        Binding("escape", "back",       "Back to sweep",  show=True),
+        Binding("i",      "cycle_rx2",  "RX2 interval",   show=True),
+        Binding("q",      "app.quit",   "Quit",           show=True),
     ]
 
-    def __init__(self, scanner: HardwareScanner, freq: int, sf: int, freq_hop: bool = False):
+    def __init__(self, scanner: HardwareScanner, freq: int, sf: int,
+                 freq_hop: bool = False, is_downlink: bool = False):
         super().__init__()
         self._scanner = scanner
         self._freq = freq
         self._sf = sf
         self._freq_hop = freq_hop
+        self._is_downlink = is_downlink
         self._pkts: list[PacketRecord] = []
         self._addrs: set[str] = set()
         self._downlinks = 0
@@ -374,7 +423,10 @@ class LockScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        if self._freq_hop:
+        if self._is_downlink:
+            hdr = (f"RX2 LOCK  {self._freq/1e6:.3f} MHz  SF{self._sf}"
+                   f"  ↓ downlinks only  BW=125 kHz  CR=4/5   [Esc] back to sweep")
+        elif self._freq_hop:
             hdr = (f"SF-HOP  SF{self._sf}  all EU868 channels  BW=125 kHz  CR=4/5"
                    f"   [Esc] back to sweep")
         else:
@@ -391,6 +443,7 @@ class LockScreen(Screen):
         t.add_column("Time UTC",  width=10)
         t.add_column("RSSI",      width=7)
         t.add_column("SNR",       width=6)
+        t.add_column("Margin",    width=8)
         t.add_column("Type",      width=22)
         t.add_column("DevAddr",   width=10)
         t.add_column("FCnt",      width=6)
@@ -399,6 +452,7 @@ class LockScreen(Screen):
         t.add_column("MAC Cmds",  width=50)
         self._scanner.start_lock(
             freq=self._freq, sf=self._sf, freq_hop=self._freq_hop,
+            is_downlink=self._is_downlink,
             on_packet=lambda p: self._post_to_ui(self._on_packet, p),
             on_channel=lambda f, s: self._post_to_ui(self._on_channel, f, s),
         )
@@ -419,8 +473,14 @@ class LockScreen(Screen):
         except Exception:
             return
         dwell = SF_DWELL[sf]
-        label = "RX2 check" if (freq == RX2_FREQ and sf == RX2_SF) else "Scanning"
-        status.update(f"{label}  {freq/1e6:.3f} MHz  SF{sf}  dwell={dwell}s")
+        if self._is_downlink:
+            status.update(f"RX2  {freq/1e6:.3f} MHz  SF{sf}  dwell={dwell}s  IQINVER=1")
+        else:
+            label = "RX2 check" if (freq == RX2_FREQ and sf == RX2_SF) else "Scanning"
+            status.update(
+                f"{label}  {freq/1e6:.3f} MHz  SF{sf}  dwell={dwell}s"
+                f"  |  RX2 every {self._scanner.rx2_interval} hops  [I]"
+            )
 
     def _on_packet(self, pkt: PacketRecord) -> None:
         try:
@@ -442,10 +502,12 @@ class LockScreen(Screen):
         if pkt.is_downlink:
             flags.append("DL")
 
+        margin = _link_margin(pkt.rssi, pkt.sf)
         t.add_row(
-            pkt.timestamp[-9:],
+            pkt.timestamp[11:19],
             str(pkt.rssi) if pkt.rssi is not None else "?",
             str(pkt.snr)  if pkt.snr  is not None else "?",
+            f"{margin:+d} dB" if margin is not None else "?",
             (pkt.mtype or "?")[:22],
             pkt.dev_addr or pkt.join_eui or "?",
             str(pkt.fcnt) if pkt.fcnt is not None else "?",
@@ -480,6 +542,13 @@ class LockScreen(Screen):
         stats.update("\n".join(lines))
 
     # ---- action ------------------------------------------------------------
+
+    def action_cycle_rx2(self) -> None:
+        presets = HardwareScanner.RX2_PRESETS
+        cur = self._scanner.rx2_interval
+        nxt = presets[(presets.index(cur) + 1) % len(presets)] if cur in presets else presets[0]
+        self._scanner.rx2_interval = nxt
+        self.notify(f"RX2 check every {nxt} hops", timeout=2)
 
     def action_back(self) -> None:
         self._scanner.stop()
