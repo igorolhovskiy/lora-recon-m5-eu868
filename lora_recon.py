@@ -19,7 +19,7 @@ Key commands used:
   AT+PBW=<125|250|500> → set bandwidth kHz
   AT+PCR=<0-3>      → coding rate (0=4/5, 1=4/6, 2=4/7, 3=4/8)
   AT+PPL=8          → preamble length
-  AT+PRECV=<ms>     → open RX window; 65535 = continuous until packet or timeout
+  AT+PRECV=<ms>     → open RX window; 65534 = continuous until packet or timeout
   AT+RSSI=?         → last packet RSSI
   AT+SNR=?          → last packet SNR
 Async events from module:
@@ -377,12 +377,16 @@ class LoRaUnit:
 
     def configure_p2p(self, freq: int, sf: int, bw: int = 125,
                        cr: int = 0, preamble: int = 8) -> bool:
-        """Set all P2P radio parameters atomically."""
-        cmd = f"AT+P2P={freq}:{sf}:{bw}:{cr}:{preamble}:14"
+        """Set all P2P radio parameters atomically.
+
+        AT+P2P bandwidth field is an index: 0=125kHz, 1=250kHz, 2=500kHz.
+        """
+        _BW_IDX = {125: 0, 250: 1, 500: 2}
+        cmd = f"AT+P2P={freq}:{sf}:{_BW_IDX[bw]}:{cr}:{preamble}:14"
         return self.cmd_ok(cmd)
 
-    def start_rx(self, window_ms: int = 65535) -> bool:
-        """Open P2P receive window. 65535 = continuous until packet."""
+    def start_rx(self, window_ms: int = 65534) -> bool:
+        """Open P2P receive window. 65534 = continuous until packet."""
         return self.cmd_ok(f"AT+PRECV={window_ms}")
 
     def stop_rx(self) -> bool:

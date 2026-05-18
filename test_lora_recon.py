@@ -367,7 +367,7 @@ class TestLoRaUnit:
         assert unit.configure_p2p(868100000, 7) is True
         call_args = unit.ser.write.call_args_list
         written = b"".join(c[0][0] for c in call_args)
-        assert b"AT+P2P=868100000:7:125:0:8:14" in written
+        assert b"AT+P2P=868100000:7:0:0:8:14" in written
 
     def test_start_rx(self):
         unit = self._make_unit(["OK"])
