@@ -7,17 +7,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 All Python work requires the local virtual environment:
 
 ```bash
-source venv/bin/activate          # activate
+source .pyproject/bin/activate          # activate
 python -m pip install pyserial rich textual pytest pytest-asyncio  # if rebuilding
 ```
 
-The venv lives at `./venv/` and must be activated before any `python` or `pytest` call. Python 3.11+ is required (3.14 is in use).
+The venv lives at `./.pyproject/` and must be activated before any `python` or `pytest` call. Python 3.11+ is required (3.12 is in use).
 
 ## Commands
 
 ```bash
 # Run all tests (no hardware needed — serial I/O is fully mocked)
-source venv/bin/activate && python -m pytest
+source .pyproject/bin/activate && python -m pytest
 
 # Run a single test file
 python -m pytest test_lora_recon.py -v

@@ -70,6 +70,143 @@ MTYPE = {
 }
 
 # ---------------------------------------------------------------------------
+# MAC command (FOpts) parser — LoRaWAN 1.0.x (unencrypted in-band commands)
+# ---------------------------------------------------------------------------
+_EU868_DR_SF = {0: "SF12", 1: "SF11", 2: "SF10", 3: "SF9",
+                4: "SF8",  5: "SF7",  6: "SF7/BW250", 7: "FSK"}
+_EU868_TXPOW = {0: 16, 1: 14, 2: 12, 3: 10, 4: 8, 5: 6}  # dBm ERP; 15=keep
+
+
+def _hz_from_3bytes(b: bytes, offset: int) -> float:
+    """3-byte LE frequency field (100 Hz steps) → MHz."""
+    raw = b[offset] | (b[offset + 1] << 8) | (b[offset + 2] << 16)
+    return raw * 100 / 1e6
+
+
+def _parse_dl_cmd(cid: int, b: bytes) -> tuple[str, int]:
+    """Decode one downlink MAC command. Returns (description, payload_bytes_consumed)."""
+    if cid == 0x02:  # LinkCheckAns
+        if len(b) < 2: raise ValueError
+        return f"LinkCheckAns(margin={b[0]}dB gw={b[1]})", 2
+    if cid == 0x03:  # LinkADRReq
+        if len(b) < 4: raise ValueError
+        dr, txpow = (b[0] >> 4) & 0x0F, b[0] & 0x0F
+        mask = b[1] | (b[2] << 8)
+        nb, ctrl = b[3] & 0x0F, (b[3] >> 4) & 0x07
+        sf = _EU868_DR_SF.get(dr, f"DR{dr}")
+        pw = (f"{_EU868_TXPOW[txpow]}dBm" if txpow in _EU868_TXPOW
+              else ("keep" if txpow == 15 else f"txpow{txpow}"))
+        return f"LinkADRReq({sf} pwr={pw} mask=0x{mask:04X} ctrl={ctrl} ntx={nb})", 4
+    if cid == 0x04:  # DutyCycleReq
+        if len(b) < 1: raise ValueError
+        dc = b[0] & 0x0F
+        return f"DutyCycleReq(max={'none' if dc == 0 else f'1/{2**dc}'})", 1
+    if cid == 0x05:  # RXParamSetupReq
+        if len(b) < 4: raise ValueError
+        rx1_off, rx2_dr = (b[0] >> 4) & 0x07, b[0] & 0x0F
+        freq = _hz_from_3bytes(b, 1)
+        return f"RXParamSetupReq(RX1off={rx1_off} RX2={_EU868_DR_SF.get(rx2_dr, f'DR{rx2_dr}')}@{freq:.3f}MHz)", 4
+    if cid == 0x06:  # DevStatusReq
+        return "DevStatusReq", 0
+    if cid == 0x07:  # NewChannelReq
+        if len(b) < 5: raise ValueError
+        freq = _hz_from_3bytes(b, 1)
+        min_sf = _EU868_DR_SF.get(b[4] & 0x0F, f"DR{b[4] & 0x0F}")
+        max_sf = _EU868_DR_SF.get((b[4] >> 4) & 0x0F, f"DR{(b[4] >> 4) & 0x0F}")
+        return f"NewChannelReq(ch={b[0]} {freq:.3f}MHz {min_sf}-{max_sf})", 5
+    if cid == 0x08:  # RXTimingSetupReq
+        if len(b) < 1: raise ValueError
+        delay = b[0] & 0x0F
+        return f"RXTimingSetupReq(RX1_delay={delay or 1}s)", 1
+    if cid == 0x09:  # TxParamSetupReq
+        if len(b) < 1: raise ValueError
+        _eirp = [8, 10, 12, 13, 14, 16, 18, 20, 21, 24, 26, 27, 29, 30, 33]
+        eirp = _eirp[b[0] & 0x0F] if (b[0] & 0x0F) < len(_eirp) else b[0] & 0x0F
+        return (f"TxParamSetupReq(maxEIRP={eirp}dBm "
+                f"ul_dwell={int(bool(b[0] & 0x10))} dl_dwell={int(bool(b[0] & 0x20))})"), 1
+    if cid == 0x0A:  # DlChannelReq
+        if len(b) < 4: raise ValueError
+        return f"DlChannelReq(ch={b[0]} {_hz_from_3bytes(b, 1):.3f}MHz)", 4
+    if cid == 0x0D:  # DeviceTimeAns — GPS seconds; 18 leap-second offset as of 2024
+        if len(b) < 5: raise ValueError
+        gps_s = struct.unpack_from("<I", b, 0)[0]
+        try:
+            dt = datetime.fromtimestamp(gps_s + 315964800 - 18,
+                                        tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            dt = f"GPS+{gps_s}s"
+        return f"DeviceTimeAns({dt} +{b[4]}/256s)", 5
+    return f"UnknownDL(0x{cid:02X})", 0
+
+
+def _parse_ul_cmd(cid: int, b: bytes) -> tuple[str, int]:
+    """Decode one uplink MAC command. Returns (description, payload_bytes_consumed)."""
+    if cid == 0x02:  # LinkCheckReq
+        return "LinkCheckReq", 0
+    if cid == 0x03:  # LinkADRAns
+        if len(b) < 1: raise ValueError
+        s = b[0]
+        return (f"LinkADRAns(pwr={'OK' if s & 4 else 'FAIL'} "
+                f"dr={'OK' if s & 2 else 'FAIL'} ch={'OK' if s & 1 else 'FAIL'})"), 1
+    if cid == 0x04:  # DutyCycleAns
+        return "DutyCycleAns", 0
+    if cid == 0x05:  # RXParamSetupAns
+        if len(b) < 1: raise ValueError
+        s = b[0]
+        return (f"RXParamSetupAns(rx1_off={'OK' if s & 4 else 'FAIL'} "
+                f"rx2_dr={'OK' if s & 2 else 'FAIL'} ch={'OK' if s & 1 else 'FAIL'})"), 1
+    if cid == 0x06:  # DevStatusAns
+        if len(b) < 2: raise ValueError
+        batt = b[0]
+        raw = b[1] & 0x3F
+        margin = raw if raw < 32 else raw - 64   # 6-bit signed
+        if batt == 0:       batt_str = "ext"
+        elif batt == 255:   batt_str = "unknown"
+        else:               batt_str = f"{round((batt - 1) / 253 * 100)}%"
+        return f"DevStatusAns(batt={batt_str} snr_margin={margin}dB)", 2
+    if cid == 0x07:  # NewChannelAns
+        if len(b) < 1: raise ValueError
+        s = b[0]
+        return (f"NewChannelAns(dr={'OK' if s & 2 else 'FAIL'} "
+                f"ch={'OK' if s & 1 else 'FAIL'})"), 1
+    if cid == 0x08:  # RXTimingSetupAns
+        return "RXTimingSetupAns", 0
+    if cid == 0x09:  # TxParamSetupAns
+        return "TxParamSetupAns", 0
+    if cid == 0x0A:  # DlChannelAns
+        if len(b) < 1: raise ValueError
+        s = b[0]
+        return (f"DlChannelAns(ul_freq={'OK' if s & 2 else 'FAIL'} "
+                f"ch={'OK' if s & 1 else 'FAIL'})"), 1
+    if cid == 0x0D:  # DeviceTimeReq
+        return "DeviceTimeReq", 0
+    return f"UnknownUL(0x{cid:02X})", 0
+
+
+def parse_fopts(fopts: bytes, is_uplink: bool) -> list[str]:
+    """
+    Decode LoRaWAN 1.0.x MAC commands from FOpts bytes.
+    FOpts are unencrypted in LoRaWAN 1.0.x; returns garbage for 1.1 networks.
+    """
+    results = []
+    i = 0
+    _parse = _parse_ul_cmd if is_uplink else _parse_dl_cmd
+    while i < len(fopts):
+        cid = fopts[i]
+        i += 1
+        try:
+            desc, length = _parse(cid, fopts[i:])
+            results.append(desc)
+            i += length
+            if length == 0 and "Unknown" in desc:
+                break  # can't determine payload length for unknown CID
+        except (ValueError, IndexError):
+            results.append(f"CID=0x{cid:02X}(truncated)")
+            break
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 @dataclass
@@ -88,16 +225,19 @@ class PacketRecord:
     fcnt:       Optional[int]  = None
     join_eui:   Optional[str]  = None
     dev_eui:    Optional[str]  = None
-    is_downlink: bool          = False   # True if heard on RX2
+    is_downlink:  bool               = False   # True if heard on RX2
+    mac_commands: Optional[list[str]] = None
 
     def summary(self) -> str:
-        dl = " [DOWNLINK→GATEWAY EVIDENCE]" if self.is_downlink else ""
+        dl  = " [DOWNLINK→GATEWAY EVIDENCE]" if self.is_downlink else ""
+        mac = (f"  MAC=[{', '.join(self.mac_commands)}]"
+               if self.mac_commands else "")
         addr_part = f"DevAddr={self.dev_addr}" if self.dev_addr else (
             f"JoinEUI={self.join_eui}" if self.join_eui else "DevAddr=?")
         return (f"{self.timestamp}  {self.freq/1e6:.3f}MHz SF{self.sf} BW{self.bw} "
                 f"RSSI={self.rssi}dBm SNR={self.snr}dB  "
                 f"mtype={self.mtype or '?'}  {addr_part}  "
-                f"FCnt={self.fcnt if self.fcnt is not None else '?'}{dl}")
+                f"FCnt={self.fcnt if self.fcnt is not None else '?'}{dl}{mac}")
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +270,12 @@ def parse_lorawan(raw_hex: str) -> dict:
             result["fcnt"] = struct.unpack_from("<H", data, 6)[0]
             result["ack"]  = bool(fctrl & 0x20)
             result["adr"]  = bool(fctrl & 0x80)
+            fopts_len = fctrl & 0x0F
+            if fopts_len > 0 and len(data) >= 8 + fopts_len:
+                is_uplink = mtype_bits in (0b010, 0b100)
+                cmds = parse_fopts(data[8:8 + fopts_len], is_uplink)
+                if cmds:
+                    result["mac_commands"] = cmds
         elif mtype_bits == 0b000:   # Join Request
             if len(data) >= 19:
                 join_eui = data[1:9][::-1].hex().upper()
@@ -391,7 +537,10 @@ class OutputManager:
             self.records.append(pkt)
             self._print_packet(pkt)
             if self._csv_writer:
-                self._csv_writer.writerow(asdict(pkt))
+                row = asdict(pkt)
+                if row.get("mac_commands"):
+                    row["mac_commands"] = " | ".join(row["mac_commands"])
+                self._csv_writer.writerow(row)
                 self._csv_file.flush()
 
     def _print_packet(self, pkt: PacketRecord):
@@ -571,6 +720,7 @@ class SweepScanner:
             join_eui=lw.get("join_eui"),
             dev_eui=lw.get("dev_eui"),
             is_downlink=is_downlink,
+            mac_commands=lw.get("mac_commands"),
         )
 
 
@@ -579,34 +729,43 @@ class SweepScanner:
 # ---------------------------------------------------------------------------
 class LockMonitor:
     """
-    Stays locked on one freq/SF combo for deep monitoring.
-    Interleaves periodic RX2 downlink checks.
+    Phase 2 deep monitoring. Two modes:
+      freq_hop=False  — fixed freq + SF (single-channel lock, original behaviour)
+      freq_hop=True   — fixed SF, cycles all 8 EU868 uplink channels each pass;
+                        follows mandatory channel-hopping and captures ~8× more packets
+    Interleaves RX2 downlink checks in both modes.
     """
     def __init__(self, unit: LoRaUnit, output: OutputManager,
                  dedup: DeduplicationCache,
-                 freq: int, sf: int,
+                 freq: Optional[int], sf: int,
+                 freq_hop: bool = False,
                  duration_minutes: float = 10.0,
                  rx2_interval: int = 10,
                  stop_event: threading.Event = None):
+        if not freq_hop and freq is None:
+            raise ValueError("freq is required when freq_hop=False")
         self.unit = unit
         self.output = output
         self.dedup = dedup
         self.freq = freq
         self.sf = sf
+        self.freq_hop = freq_hop
         self.duration = duration_minutes * 60
         self.rx2_interval = rx2_interval
         self.stop_event = stop_event or threading.Event()
         self._cycle = 0
         self.log = logging.getLogger("Lock")
 
-        # Deep monitoring state
         self._fcnt_history: dict[str, list[tuple[float, int]]] = defaultdict(list)
         self._rssi_history: dict[str, list[int]] = defaultdict(list)
 
     def run(self):
+        if self.freq_hop:
+            label = f"SF-HOP MODE SF{self.sf} all EU868 channels"
+        else:
+            label = f"LOCK MODE {self.freq/1e6:.3f} MHz SF{self.sf}"
         self.output.status(
-            f"=== Phase 2: LOCK MODE {self.freq/1e6:.3f} MHz SF{self.sf} "
-            f"for {self.duration/60:.1f} min ==="
+            f"=== Phase 2: {label} for {self.duration/60:.1f} min ==="
         )
         deadline = time.time() + self.duration
         while time.time() < deadline and not self.stop_event.is_set():
@@ -615,22 +774,25 @@ class LockMonitor:
         self._report_lock_stats()
 
     def _lock_cycle(self):
-        dwell = SF_DWELL[self.sf]
-        self.unit.configure_p2p(self.freq, self.sf)
-        self.unit.start_rx(int(dwell * 1000))
-        lines = self.unit.read_async_events(dwell + 0.5)
-        self.unit.stop_rx()
-
-        for pkt_dict in parse_events(lines):
-            pkt = SweepScanner._make_record(pkt_dict, self.freq, self.sf, is_downlink=False)
-            if not self.dedup.is_duplicate(pkt.dev_addr, pkt.fcnt):
-                self.output.record(pkt)
-                if pkt.dev_addr:
-                    now = time.time()
-                    if pkt.fcnt is not None:
-                        self._fcnt_history[pkt.dev_addr].append((now, pkt.fcnt))
-                    if pkt.rssi is not None:
-                        self._rssi_history[pkt.dev_addr].append(pkt.rssi)
+        channels = EU868_CHANNELS if self.freq_hop else [self.freq]
+        for freq in channels:
+            if self.stop_event.is_set():
+                return
+            dwell = SF_DWELL[self.sf]
+            self.unit.configure_p2p(freq, self.sf)
+            self.unit.start_rx(int(dwell * 1000))
+            lines = self.unit.read_async_events(dwell + 0.5)
+            self.unit.stop_rx()
+            for pkt_dict in parse_events(lines):
+                pkt = SweepScanner._make_record(pkt_dict, freq, self.sf, is_downlink=False)
+                if not self.dedup.is_duplicate(pkt.dev_addr, pkt.fcnt):
+                    self.output.record(pkt)
+                    if pkt.dev_addr:
+                        now = time.time()
+                        if pkt.fcnt is not None:
+                            self._fcnt_history[pkt.dev_addr].append((now, pkt.fcnt))
+                        if pkt.rssi is not None:
+                            self._rssi_history[pkt.dev_addr].append(pkt.rssi)
 
         self._cycle += 1
         if self._cycle % self.rx2_interval == 0:
@@ -703,6 +865,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Only run Phase 1 sweep, never enter lock mode")
     p.add_argument("--lock-freq",      type=int, default=None,
                    help="Skip sweep, lock on this frequency (Hz)")
+    p.add_argument("--freq-hop",       action="store_true",
+                   help="Lock mode: hop all EU868 channels at fixed SF (better for tracking devices)")
     p.add_argument("--lock-sf",        type=int, default=7,
                    choices=SPREADING_FACTORS,
                    help="SF for direct lock mode")
@@ -787,6 +951,7 @@ def main():
             monitor = LockMonitor(
                 unit=unit, output=output, dedup=dedup,
                 freq=args.lock_freq, sf=args.lock_sf,
+                freq_hop=args.freq_hop,
                 duration_minutes=args.lock_duration,
                 rx2_interval=args.rx2_interval,
                 stop_event=stop_event)
@@ -822,6 +987,7 @@ def main():
                     monitor = LockMonitor(
                         unit=unit, output=output, dedup=dedup,
                         freq=freq, sf=sf,
+                        freq_hop=args.freq_hop,
                         duration_minutes=args.lock_duration,
                         rx2_interval=args.rx2_interval,
                         stop_event=stop_event)

@@ -13,6 +13,7 @@ from dataclasses import asdict
 from lora_recon import (
     parse_lorawan,
     parse_events,
+    parse_fopts,
     PacketRecord,
     DeduplicationCache,
     LoRaUnit,
@@ -97,6 +98,80 @@ class TestParseLoraWan:
 
     def test_empty(self):
         assert parse_lorawan("") == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_fopts
+# ---------------------------------------------------------------------------
+class TestParseFopts:
+    def test_link_check_req_uplink(self):
+        result = parse_fopts(bytes([0x02]), is_uplink=True)
+        assert result == ["LinkCheckReq"]
+
+    def test_link_check_ans_downlink(self):
+        result = parse_fopts(bytes([0x02, 5, 2]), is_uplink=False)
+        assert len(result) == 1
+        assert "LinkCheckAns" in result[0]
+        assert "margin=5dB" in result[0]
+        assert "gw=2" in result[0]
+
+    def test_link_adr_req_downlink(self):
+        # DR=5 (SF7), TXPow=1 (14dBm), ChMask=0x00FF, NbTrans=1, ctrl=0
+        result = parse_fopts(bytes([0x03, 0x51, 0xFF, 0x00, 0x01]), is_uplink=False)
+        assert len(result) == 1
+        assert "LinkADRReq" in result[0]
+        assert "SF7" in result[0]
+        assert "14dBm" in result[0]
+        assert "0x00FF" in result[0]
+
+    def test_dev_status_ans_uplink(self):
+        # battery=128 (~50%), margin=7dB
+        result = parse_fopts(bytes([0x06, 128, 7]), is_uplink=True)
+        assert len(result) == 1
+        assert "DevStatusAns" in result[0]
+        assert "snr_margin=7dB" in result[0]
+
+    def test_dev_status_req_downlink(self):
+        result = parse_fopts(bytes([0x06]), is_uplink=False)
+        assert result == ["DevStatusReq"]
+
+    def test_new_channel_req_downlink(self):
+        # ch=3, freq=867.1MHz (8671000 * 10 = 86710000... wait, freq in 100Hz steps
+        # 867.1 MHz = 8671000 * 100Hz = 86710000 → but that's 8671000 * 100Hz
+        # Actually: 867.1 MHz = 867100000 Hz / 100 = 8671000
+        # 8671000 in 3 bytes LE: 8671000 = 0x843E28 → [0x28, 0x3E, 0x84]
+        freq_raw = 867100000 // 100  # = 8671000
+        b = freq_raw.to_bytes(3, "little")
+        payload = bytes([0x07, 3]) + b + bytes([0x50])  # ch=3, DrRange=0x50 (min=DR0/SF12, max=DR5/SF7)
+        result = parse_fopts(payload, is_uplink=False)
+        assert len(result) == 1
+        assert "NewChannelReq" in result[0]
+        assert "867.100MHz" in result[0]
+
+    def test_multiple_commands_in_fopts(self):
+        # DevStatusReq (0x06, 0 bytes) + RXTimingSetupReq (0x08, 1 byte: delay=3)
+        result = parse_fopts(bytes([0x06, 0x08, 0x03]), is_uplink=False)
+        assert len(result) == 2
+        assert "DevStatusReq" in result[0]
+        assert "RXTimingSetupReq" in result[1]
+        assert "3s" in result[1]
+
+    def test_truncated_command(self):
+        # LinkADRReq needs 4 payload bytes; only give 2
+        result = parse_fopts(bytes([0x03, 0x51, 0xFF]), is_uplink=False)
+        assert len(result) == 1
+        assert "truncated" in result[0]
+
+    def test_fopts_in_parse_lorawan(self):
+        import struct
+        # Unconfirmed Data Up with FOptsLen=1 and a LinkCheckReq (0x02) in FOpts
+        # MHDR=0x40, DevAddr=0x260B1234, FCtrl=0x01 (FOptsLen=1), FCnt=0x0001
+        # FOpts=0x02 (LinkCheckReq)
+        dev_addr = struct.pack("<I", 0x260B1234)
+        frame = bytes([0x40]) + dev_addr + bytes([0x01, 0x01, 0x00, 0x02, 0xAA])
+        result = parse_lorawan(frame.hex())
+        assert "mac_commands" in result
+        assert result["mac_commands"] == ["LinkCheckReq"]
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +486,7 @@ class TestSweepScanner:
 # LockMonitor (mocked unit)
 # ---------------------------------------------------------------------------
 class TestLockMonitor:
-    def _make_monitor(self, cycles=2, with_packet=False):
+    def _make_monitor(self, with_packet=False, freq_hop=False):
         unit = MagicMock(spec=LoRaUnit)
         unit.configure_p2p.return_value = True
         unit.start_rx.return_value = True
@@ -435,7 +510,8 @@ class TestLockMonitor:
 
         monitor = LockMonitor(
             unit=unit, output=output, dedup=dedup,
-            freq=868100000, sf=7,
+            freq=None if freq_hop else 868100000, sf=7,
+            freq_hop=freq_hop,
             duration_minutes=0.001,  # very short
             rx2_interval=100,
             stop_event=stop,
@@ -456,6 +532,35 @@ class TestLockMonitor:
         monitor.stop_event.set()
         monitor.run()
         assert unit.configure_p2p.call_count == 0
+
+    def test_freq_hop_visits_all_channels(self):
+        monitor, unit, output = self._make_monitor(freq_hop=True)
+        monitor.run()
+        called_freqs = {c[0][0] for c in unit.configure_p2p.call_args_list}
+        for ch in EU868_CHANNELS:
+            assert ch in called_freqs
+
+    def test_freq_hop_requires_no_freq(self):
+        """freq=None is valid when freq_hop=True."""
+        unit = MagicMock(spec=LoRaUnit)
+        unit.configure_p2p.return_value = True
+        unit.start_rx.return_value = True
+        unit.stop_rx.return_value = True
+        unit.read_async_events.return_value = []
+        output = MagicMock(spec=OutputManager)
+        monitor = LockMonitor(
+            unit=unit, output=output, dedup=DeduplicationCache(),
+            freq=None, sf=9, freq_hop=True, duration_minutes=0.001,
+        )
+        monitor.run()  # should not raise
+
+    def test_single_lock_requires_freq(self):
+        """freq=None with freq_hop=False must raise."""
+        with pytest.raises(ValueError):
+            LockMonitor(
+                unit=MagicMock(), output=MagicMock(), dedup=DeduplicationCache(),
+                freq=None, sf=7, freq_hop=False,
+            )
 
 
 # ---------------------------------------------------------------------------

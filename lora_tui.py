@@ -62,6 +62,7 @@ def _make_pkt(evt: dict, freq: int, sf: int, is_downlink: bool = False) -> Packe
         join_eui=lw.get("join_eui"),
         dev_eui=lw.get("dev_eui"),
         is_downlink=is_downlink,
+        mac_commands=lw.get("mac_commands"),
     )
 
 
@@ -102,11 +103,12 @@ class HardwareScanner:
         )
         self._thread.start()
 
-    def start_lock(self, freq: int, sf: int, on_packet: Callable):
+    def start_lock(self, freq: Optional[int], sf: int, on_packet: Callable,
+                   freq_hop: bool = False, on_channel: Optional[Callable] = None):
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._lock_loop,
-            args=(freq, sf, on_packet),
+            args=(freq, sf, on_packet, freq_hop, on_channel),
             daemon=True,
             name="lora-lock",
         )
@@ -124,13 +126,22 @@ class HardwareScanner:
                 self._do_rx(freq, sf, on_packet, dedup)
             dedup.purge()
 
-    def _lock_loop(self, freq: int, sf: int, on_packet: Callable):
+    def _lock_loop(self, freq: Optional[int], sf: int, on_packet: Callable,
+                   freq_hop: bool = False, on_channel: Optional[Callable] = None):
         dedup = DeduplicationCache()
         cycle = 0
         while not self._stop.is_set():
-            self._do_rx(freq, sf, on_packet, dedup)
+            channels = EU868_CHANNELS if freq_hop else [freq]
+            for ch in channels:
+                if self._stop.is_set():
+                    return
+                if on_channel:
+                    on_channel(ch, sf)
+                self._do_rx(ch, sf, on_packet, dedup)
             cycle += 1
             if cycle % self.RX2_INTERVAL == 0:
+                if on_channel:
+                    on_channel(RX2_FREQ, RX2_SF)
                 self._do_rx(RX2_FREQ, RX2_SF, on_packet, dedup, is_downlink=True)
 
     def _do_rx(self, freq: int, sf: int, on_packet: Callable,
@@ -183,8 +194,9 @@ class SweepScreen(Screen):
     """
 
     BINDINGS = [
-        Binding("r", "reset",    "Reset stats", show=True),
-        Binding("q", "app.quit", "Quit",        show=True),
+        Binding("r", "reset",       "Reset stats",  show=True),
+        Binding("l", "lock_single", "Lock freq+SF", show=True),
+        Binding("q", "app.quit",    "Quit",         show=True),
     ]
 
     def __init__(self, scanner: HardwareScanner, device_info: str):
@@ -286,14 +298,23 @@ class SweepScreen(Screen):
     # ---- event handlers ----------------------------------------------------
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """DataTable fires this when Enter is pressed on a row."""
+        """Enter — SF-locked frequency hop (follows channel hopping across all 8 channels)."""
         idx = event.cursor_row
         if 0 <= idx < len(ALL_COMBOS):
             freq, sf = ALL_COMBOS[idx]
             self._scanner.stop()
-            self.app.push_screen(LockScreen(self._scanner, freq, sf))
+            self.app.push_screen(LockScreen(self._scanner, freq, sf, freq_hop=True))
 
     # ---- actions -----------------------------------------------------------
+
+    def action_lock_single(self) -> None:
+        """L — single channel+SF lock (fixed freq, fixed SF)."""
+        t = self.query_one("#sw_table", DataTable)
+        idx = t.cursor_row
+        if 0 <= idx < len(ALL_COMBOS):
+            freq, sf = ALL_COMBOS[idx]
+            self._scanner.stop()
+            self.app.push_screen(LockScreen(self._scanner, freq, sf, freq_hop=False))
 
     def action_reset(self) -> None:
         self._current = None
@@ -317,6 +338,12 @@ class LockScreen(Screen):
         color: $text;
         padding: 0 1;
     }
+    #lk_status {
+        height: 1;
+        background: $primary-darken-2;
+        padding: 0 1;
+        color: $text;
+    }
     #pkt_table {
         height: 2fr;
     }
@@ -333,11 +360,12 @@ class LockScreen(Screen):
         Binding("q",      "app.quit","Quit",          show=True),
     ]
 
-    def __init__(self, scanner: HardwareScanner, freq: int, sf: int):
+    def __init__(self, scanner: HardwareScanner, freq: int, sf: int, freq_hop: bool = False):
         super().__init__()
         self._scanner = scanner
         self._freq = freq
         self._sf = sf
+        self._freq_hop = freq_hop
         self._pkts: list[PacketRecord] = []
         self._addrs: set[str] = set()
         self._downlinks = 0
@@ -346,11 +374,14 @@ class LockScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static(
-            f"LOCK  {self._freq/1e6:.3f} MHz  SF{self._sf}  BW=125 kHz  CR=4/5"
-            f"   [Esc] back to sweep",
-            id="lk_header",
-        )
+        if self._freq_hop:
+            hdr = (f"SF-HOP  SF{self._sf}  all EU868 channels  BW=125 kHz  CR=4/5"
+                   f"   [Esc] back to sweep")
+        else:
+            hdr = (f"LOCK  {self._freq/1e6:.3f} MHz  SF{self._sf}  BW=125 kHz  CR=4/5"
+                   f"   [Esc] back to sweep")
+        yield Static(hdr, id="lk_header")
+        yield Static("", id="lk_status")
         yield DataTable(id="pkt_table", cursor_type="row", zebra_stripes=True)
         yield Static("Waiting for packets…", id="stats_box")
         yield Footer()
@@ -365,12 +396,31 @@ class LockScreen(Screen):
         t.add_column("FCnt",      width=6)
         t.add_column("Operator",  width=20)
         t.add_column("Flags",     width=6)
+        t.add_column("MAC Cmds",  width=50)
         self._scanner.start_lock(
-            freq=self._freq, sf=self._sf,
-            on_packet=lambda p: self.app.call_from_thread(self._on_packet, p),
+            freq=self._freq, sf=self._sf, freq_hop=self._freq_hop,
+            on_packet=lambda p: self._post_to_ui(self._on_packet, p),
+            on_channel=lambda f, s: self._post_to_ui(self._on_channel, f, s),
         )
 
-    # ---- thread callback ---------------------------------------------------
+    def _post_to_ui(self, fn, *args) -> None:
+        """Safely schedule a UI update from the scanner thread.
+        Guards against NoActiveAppError during app teardown."""
+        try:
+            self.app.call_from_thread(fn, *args)
+        except Exception:
+            pass
+
+    # ---- thread callbacks --------------------------------------------------
+
+    def _on_channel(self, freq: int, sf: int) -> None:
+        try:
+            status = self.query_one("#lk_status", Static)
+        except Exception:
+            return
+        dwell = SF_DWELL[sf]
+        label = "RX2 check" if (freq == RX2_FREQ and sf == RX2_SF) else "Scanning"
+        status.update(f"{label}  {freq/1e6:.3f} MHz  SF{sf}  dwell={dwell}s")
 
     def _on_packet(self, pkt: PacketRecord) -> None:
         try:
@@ -401,6 +451,7 @@ class LockScreen(Screen):
             str(pkt.fcnt) if pkt.fcnt is not None else "?",
             (pkt.operator or "?")[:20],
             " ".join(flags),
+            ", ".join(pkt.mac_commands) if pkt.mac_commands else "",
         )
         t.scroll_end(animate=False)
         self._update_stats(stats)

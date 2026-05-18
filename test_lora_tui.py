@@ -165,6 +165,30 @@ class TestHardwareScanner:
         s.stop()
         assert len(pkts) >= 1
 
+    def test_lock_freq_hop_visits_all_channels(self):
+        s = self._scanner()
+        seen_freqs = set()
+        done = threading.Event()
+
+        original_configure = s.unit.configure_p2p
+
+        def tracking_configure(freq, sf):
+            seen_freqs.add(freq)
+            if all(ch in seen_freqs for ch in EU868_CHANNELS):
+                done.set()
+                s._stop.set()
+            return True
+
+        s.unit.configure_p2p = tracking_configure
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_lock(freq=None, sf=7, on_packet=lambda p: None, freq_hop=True)
+            done.wait(timeout=10)
+        s.stop()
+
+        for ch in EU868_CHANNELS:
+            assert ch in seen_freqs
+
     def test_stop_joins_thread(self):
         s = self._scanner()
         with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
@@ -295,12 +319,12 @@ async def test_lock_screen_shows_packet_table():
         await pilot.pause(0.2)
         table = app.screen.query_one("#pkt_table", DataTable)
         assert table is not None
-        assert len(table.columns) == 8
+        assert len(table.columns) == 9  # +MAC Cmds column
 
 
 @pytest.mark.asyncio
-async def test_selected_combo_passed_to_lock_screen():
-    """Cursor on row 3 → LockScreen gets combo ALL_COMBOS[3]."""
+async def test_enter_sf_hop_uses_correct_sf():
+    """Enter (SF-hop): LockScreen gets SF from the selected row, freq_hop=True."""
     app, _ = _make_app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause(0.2)
@@ -311,8 +335,26 @@ async def test_selected_combo_passed_to_lock_screen():
         screen = app.screen
         assert isinstance(screen, LockScreen)
         freq, sf = ALL_COMBOS[3]
+        assert screen._sf == sf
+        assert screen._freq_hop is True
+
+
+@pytest.mark.asyncio
+async def test_l_key_single_lock_passes_freq_and_sf():
+    """L (single lock): LockScreen gets exact freq+SF from row, freq_hop=False."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.click("#sw_table")
+        await pilot.press("down", "down", "down")
+        await pilot.press("l")
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, LockScreen)
+        freq, sf = ALL_COMBOS[3]
         assert screen._freq == freq
         assert screen._sf == sf
+        assert screen._freq_hop is False
 
 
 @pytest.mark.asyncio
@@ -387,6 +429,48 @@ async def test_reset_clears_packet_counts():
         await pilot.press("r")
         await pilot.pause(0.1)
         assert screen._state[(868100000, 7)]["pkts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lock_screen_channel_callback_updates_status():
+    """_on_channel updates the #lk_status bar with freq, SF and dwell."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.click("#sw_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, LockScreen)
+        app._scanner.stop()
+        await pilot.pause(0.1)
+        screen._on_channel(868300000, 9)
+        await pilot.pause(0.1)
+        status = screen.query_one("#lk_status", Static)
+        text = str(status.content)
+        assert "868.300" in text
+        assert "SF9" in text
+        assert "dwell=" in text   # exact value varies (patched to 20ms in tests)
+
+
+@pytest.mark.asyncio
+async def test_lock_screen_rx2_check_label():
+    """_on_channel with RX2 freq shows 'RX2 check' label."""
+    from lora_recon import RX2_FREQ, RX2_SF
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.click("#sw_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, LockScreen)
+        app._scanner.stop()
+        await pilot.pause(0.1)
+        screen._on_channel(RX2_FREQ, RX2_SF)
+        await pilot.pause(0.1)
+        status = screen.query_one("#lk_status", Static)
+        assert "RX2 check" in str(status.content)
 
 
 @pytest.mark.asyncio
