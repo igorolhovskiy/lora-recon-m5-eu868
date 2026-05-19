@@ -131,6 +131,7 @@ The sweep checks the RX2 channel (IQINVER=1, correct polarity for downlinks) eve
 | L | **Single lock** — fix both frequency and SF from selected row |
 | I | Cycle RX2 check interval (1 / 2 / 5 / 10 / 20 hops) |
 | R | Reset all statistics |
+| C | Copy selected row to clipboard |
 | Q | Quit |
 
 ### Lock screen — SF-hop mode (Enter)
@@ -164,8 +165,32 @@ Fixes both the frequency and SF. Useful when you want to deep-monitor a specific
 
 | Key | Action |
 |---|---|
+| Enter | Open full packet detail for the selected row |
 | I | Cycle RX2 check interval (1 / 2 / 5 / 10 / 20 hops) |
+| C | Copy selected packet detail to clipboard |
 | Esc | Return to sweep screen |
+| Q | Quit |
+
+### Packet detail screen
+
+Press **Enter** on any row in the lock view to open the full packet decode and reconnaissance analysis for that packet.
+
+![Packet detail screen](screenshots/packet_detail.svg)
+
+The detail screen shows four sections:
+
+- **RF LAYER** — frequency, SF, bandwidth, IQ polarity, RSSI, SNR, link margin, frame length, and estimated airtime with EU868 duty-cycle impact.
+- **LORAWAN FRAME** — timestamp, raw hex, MHDR message type, direction, DevAddr / NwkID / operator / FCnt / ADR+ACK flags (data frames), or JoinEUI / DevEUI / OUI (join requests).
+- **MAC COMMANDS (FOpts)** — decoded MAC command list, shown only when FOpts are present.
+- **RECONNAISSANCE ANALYSIS** — plain-English interpretation: what the frame type reveals, signal strength assessment, device proximity estimate, and ADR / ACK / FCnt observations.
+
+**Packet detail controls:**
+
+| Key | Action |
+|---|---|
+| ← / → | Navigate to the previous / next captured packet |
+| C | Copy full packet detail to clipboard |
+| Esc | Return to lock screen |
 | Q | Quit |
 
 ---

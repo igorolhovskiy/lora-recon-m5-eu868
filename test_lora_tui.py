@@ -20,11 +20,14 @@ from lora_tui import (
     HardwareScanner,
     SweepScreen,
     LockScreen,
+    PacketDetailScreen,
     LoRaTUIApp,
     ALL_COMBOS,
     SF_SENSITIVITY,
     _make_pkt,
     _link_margin,
+    _lorawan_airtime_ms,
+    _format_packet_detail,
 )
 from textual.widgets import DataTable, Static
 
@@ -36,16 +39,23 @@ FAST_DWELL = {sf: 0.02 for sf in range(7, 13)}   # 20 ms per channel in tests
 
 
 def _mock_unit(readline_lines=None):
-    """LoRaUnit with mocked serial, returning given lines then empty forever."""
+    """LoRaUnit with mocked serial; returns provided lines then blocks briefly."""
     mock_ser = MagicMock()
-    if readline_lines:
-        mock_ser.readline.side_effect = (
-            [(l + "\r\n").encode() if l else b"" for l in readline_lines]
-            + [b""] * 10_000
-        )
-    else:
-        mock_ser.readline.return_value = b""
-    mock_ser.timeout = 2.0
+    mock_ser.timeout = 0.2
+
+    lines = [(l + "\r\n").encode() if l else b"" for l in (readline_lines or [])]
+    idx = 0
+
+    def blocking_readline():
+        nonlocal idx
+        if idx < len(lines):
+            val = lines[idx]
+            idx += 1
+            return val
+        time.sleep(0.01)  # simulate blocking I/O; prevents busy-spinning and StopIteration cascades
+        return b""
+
+    mock_ser.readline.side_effect = blocking_readline
 
     with patch("lora_recon.serial.Serial", return_value=mock_ser):
         unit = LoRaUnit("/dev/null")
@@ -358,9 +368,10 @@ class TestLinkMargin:
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def fast_dwell_fixture():
-    """Patch SF_DWELL to 20 ms for all async tests."""
+    """Patch SF_DWELL to 20 ms and rx overhead to 0 for all tests."""
     with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
-        yield
+        with patch.object(HardwareScanner, '_rx_overhead', 0.0):
+            yield
 
 
 @pytest.mark.asyncio
@@ -819,3 +830,311 @@ async def test_rx2_packet_appears_in_sweep_table():
         assert state["pkts"] == 1
         assert state["rssi"] == -95
         assert state["margin"] == -95 - (-137)  # +42 dB
+
+
+# ---------------------------------------------------------------------------
+# _lorawan_airtime_ms
+# ---------------------------------------------------------------------------
+class TestAirtimeMs:
+    def test_returns_positive(self):
+        assert _lorawan_airtime_ms(20, 7) > 0
+
+    def test_sf12_longer_than_sf7(self):
+        assert _lorawan_airtime_ms(20, 12) > _lorawan_airtime_ms(20, 7)
+
+    def test_longer_payload_more_airtime(self):
+        assert _lorawan_airtime_ms(30, 9) > _lorawan_airtime_ms(10, 9)
+
+    def test_zero_payload_still_has_preamble(self):
+        assert _lorawan_airtime_ms(0, 7) > 0
+
+    def test_sf7_20bytes_in_expected_range(self):
+        # SF7 BW=125kHz 20-byte payload: ~56 ms per Semtech LoRa calculator
+        airtime = _lorawan_airtime_ms(20, 7)
+        assert 40 < airtime < 80
+
+    def test_sf12_low_dr_optimisation_applied(self):
+        # SF12 BW=125kHz triggers DE=1; airtime should be longer than without it
+        airtime_sf12 = _lorawan_airtime_ms(20, 12)
+        airtime_sf11 = _lorawan_airtime_ms(20, 11)
+        assert airtime_sf12 > airtime_sf11
+
+    def test_all_sfs_return_finite(self):
+        for sf in range(7, 13):
+            a = _lorawan_airtime_ms(20, sf)
+            assert a > 0
+            assert a < 30000  # no SF takes > 30 s for a normal payload
+
+
+# ---------------------------------------------------------------------------
+# _format_packet_detail
+# ---------------------------------------------------------------------------
+def _join_request_pkt() -> PacketRecord:
+    """Minimal Join Request PacketRecord with known fields."""
+    join_eui = bytes.fromhex("0102030405060708")[::-1]
+    dev_eui  = bytes.fromhex("AABBCCDDEEFF0011")[::-1]
+    raw = bytes([0x00]) + join_eui + dev_eui + bytes([0x01, 0x00]) + bytes(4)
+    return PacketRecord(
+        timestamp="2024-01-15T12:34:56+00:00",
+        freq=868100000, sf=7, bw=125,
+        rssi=-85, snr=8,
+        raw_hex=raw.hex().upper(),
+        mtype="Join Request",
+        join_eui="0807060504030201",
+        dev_eui="1100FFEEDDCCBBAA",
+    )
+
+
+def _uplink_pkt() -> PacketRecord:
+    frame = _uplink_frame(0x260B1234, fcnt=42)
+    return PacketRecord(
+        timestamp="2024-01-15T12:34:56+00:00",
+        freq=868100000, sf=9, bw=125,
+        rssi=-90, snr=5,
+        raw_hex=frame,
+        mtype="Unconfirmed Data Up",
+        dev_addr="260B1234",
+        nwk_id="0x13",
+        operator="TTN (The Things Network)",
+        fcnt=42,
+    )
+
+
+def _downlink_pkt() -> PacketRecord:
+    return PacketRecord(
+        timestamp="2024-01-15T12:34:56+00:00",
+        freq=869525000, sf=12, bw=125,
+        rssi=-95, snr=3,
+        raw_hex="",
+        mtype="Unconfirmed Data Down",
+        is_downlink=True,
+    )
+
+
+class TestFormatPacketDetail:
+    def test_rf_section_present(self):
+        text = _format_packet_detail(_uplink_pkt())
+        assert "RF LAYER" in text
+        assert "868.100 MHz" in text
+        assert "SF9" in text
+
+    def test_lorawan_section_present(self):
+        text = _format_packet_detail(_uplink_pkt())
+        assert "LORAWAN FRAME" in text
+        assert "260B1234" in text
+        assert "42" in text  # FCnt
+
+    def test_link_margin_shown(self):
+        # RSSI=-90, SF9, floor=-129 → margin = +39
+        text = _format_packet_detail(_uplink_pkt())
+        assert "+39 dB" in text
+
+    def test_airtime_shown(self):
+        text = _format_packet_detail(_uplink_pkt())
+        assert "airtime" in text.lower()
+        assert " ms" in text
+
+    def test_join_request_analysis(self):
+        text = _format_packet_detail(_join_request_pkt())
+        assert "OTAA join attempt" in text
+        assert "NOT encrypted" in text
+        assert "DevEUI" in text
+        assert "JoinEUI" in text
+
+    def test_join_request_oui_shown(self):
+        text = _format_packet_detail(_join_request_pkt())
+        assert "1100FF" in text  # OUI from DevEUI "1100FFEEDDCCBBAA"
+
+    def test_uplink_analysis(self):
+        text = _format_packet_detail(_uplink_pkt())
+        assert "Regular uplink" in text
+        assert "AES-128 encrypted" in text
+        assert "TTN" in text
+
+    def test_downlink_analysis(self):
+        text = _format_packet_detail(_downlink_pkt())
+        assert "gateway confirmed" in text.lower() or "gateway" in text.lower()
+        assert "RX2" in text
+
+    def test_recon_section_present(self):
+        for pkt in [_join_request_pkt(), _uplink_pkt(), _downlink_pkt()]:
+            assert "RECONNAISSANCE ANALYSIS" in _format_packet_detail(pkt)
+
+    def test_strong_signal_note(self):
+        # Link margin >= 20 → "very strong" note
+        pkt = _uplink_pkt()
+        pkt.rssi = -60  # SF9 floor=-129 → margin=69
+        text = _format_packet_detail(pkt)
+        assert "very strong" in text.lower()
+
+    def test_iq_polarity_downlink(self):
+        text = _format_packet_detail(_downlink_pkt())
+        assert "inverted" in text
+
+    def test_iq_polarity_uplink(self):
+        text = _format_packet_detail(_uplink_pkt())
+        assert "normal" in text
+
+    def test_no_raw_hex_does_not_crash(self):
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=868100000, sf=7, bw=125,
+            rssi=None, snr=None, raw_hex="",
+        )
+        text = _format_packet_detail(pkt)
+        assert "RF LAYER" in text  # still renders
+
+
+# ---------------------------------------------------------------------------
+# PacketDetailScreen UI tests
+# ---------------------------------------------------------------------------
+async def _navigate_to_lock_with_packet(pilot, app, dev_addr_int=0x260B1234, fcnt=7):
+    """Helper: start app, enter lock, stop scanner, inject one packet."""
+    await pilot.pause(0.2)
+    await pilot.click("#sw_table")
+    await pilot.press("enter")
+    await pilot.pause(0.2)
+    screen = app.screen
+    assert isinstance(screen, LockScreen)
+    app._scanner.stop()
+    frame = _uplink_frame(dev_addr_int, fcnt)
+    pkt = _make_pkt({"rssi": -85, "snr": 7, "raw_hex": frame},
+                    screen._freq, screen._sf)
+    screen._on_packet(pkt)
+    await pilot.pause(0.1)
+    return screen
+
+
+@pytest.mark.asyncio
+async def test_enter_on_packet_row_opens_detail_screen():
+    """Enter on pkt_table row pushes PacketDetailScreen."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _navigate_to_lock_with_packet(pilot, app)
+        await pilot.click("#pkt_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, PacketDetailScreen)
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_escape_returns_to_lock():
+    """Esc from PacketDetailScreen returns to LockScreen."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _navigate_to_lock_with_packet(pilot, app)
+        await pilot.click("#pkt_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, PacketDetailScreen)
+        await pilot.press("escape")
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, LockScreen)
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_shows_dev_addr():
+    """PacketDetailScreen body contains the packet's DevAddr."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _navigate_to_lock_with_packet(pilot, app, dev_addr_int=0x260B9ABC)
+        await pilot.click("#pkt_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        detail = app.screen
+        assert isinstance(detail, PacketDetailScreen)
+        body = detail.query_one("#pd_body", Static)
+        assert "260B9ABC" in str(body.content)
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_header_shows_packet_count():
+    """PacketDetailScreen header shows '1 of 1' for a single packet."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _navigate_to_lock_with_packet(pilot, app)
+        await pilot.click("#pkt_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        detail = app.screen
+        assert isinstance(detail, PacketDetailScreen)
+        header = detail.query_one("#pd_header", Static)
+        assert "1 of 1" in str(header.content)
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_right_arrow_navigates_next():
+    """Right arrow in PacketDetailScreen increments the packet index."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.2)
+        await pilot.click("#sw_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        screen = app.screen
+        assert isinstance(screen, LockScreen)
+        app._scanner.stop()
+        for i, fcnt in enumerate([1, 2]):
+            pkt = _make_pkt(
+                {"rssi": -80, "snr": 6,
+                 "raw_hex": _uplink_frame(0x260B0001 + i, fcnt=fcnt)},
+                screen._freq, screen._sf,
+            )
+            screen._on_packet(pkt)
+        await pilot.pause(0.1)
+        await pilot.click("#pkt_table")
+        await pilot.press("enter")  # opens detail at row 0
+        await pilot.pause(0.2)
+        detail = app.screen
+        assert isinstance(detail, PacketDetailScreen)
+        assert detail._idx == 0
+        await pilot.press("right")
+        await pilot.pause(0.1)
+        assert detail._idx == 1
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_left_at_first_does_not_wrap():
+    """Left arrow at index 0 does not decrement below zero."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _navigate_to_lock_with_packet(pilot, app)
+        await pilot.click("#pkt_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        detail = app.screen
+        assert isinstance(detail, PacketDetailScreen)
+        assert detail._idx == 0
+        await pilot.press("left")
+        await pilot.pause(0.1)
+        assert detail._idx == 0  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_right_at_last_does_not_wrap():
+    """Right arrow at the last packet does not exceed bounds."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _navigate_to_lock_with_packet(pilot, app)
+        await pilot.click("#pkt_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        detail = app.screen
+        assert isinstance(detail, PacketDetailScreen)
+        assert detail._idx == 0
+        await pilot.press("right")  # already at the only packet
+        await pilot.pause(0.1)
+        assert detail._idx == 0  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_q_quits():
+    """Q key in PacketDetailScreen exits the app."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _navigate_to_lock_with_packet(pilot, app)
+        await pilot.click("#pkt_table")
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, PacketDetailScreen)
+        await pilot.press("q")

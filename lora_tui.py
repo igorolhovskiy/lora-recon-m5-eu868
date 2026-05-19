@@ -7,16 +7,29 @@ Usage:
 
 Controls — Sweep view:
     ↑ ↓     Navigate channel/SF rows
-    Enter   Lock onto selected combination (passive monitor)
+    Enter   Lock onto selected combination (SF-hop mode)
+    L       Lock onto selected combination (single-channel mode)
     R       Reset statistics
+    I       Cycle RX2 check interval
     Q       Quit
 
 Controls — Lock view:
+    Enter   Open packet detail screen for selected packet
     Esc     Return to sweep
+    I       Cycle RX2 check interval
+    Q       Quit
+
+Controls — Packet detail view:
+    ← →     Navigate between captured packets
+    Esc     Return to lock view
     Q       Quit
 """
 
 import argparse
+import math
+import os
+import re
+import subprocess
 import sys
 import time
 import threading
@@ -25,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Optional, Callable
 
 from textual.app import App, ComposeResult
+from textual.containers import VerticalScroll
 from textual.widgets import DataTable, Header, Footer, Static
 from textual.screen import Screen
 from textual.binding import Binding
@@ -46,12 +60,275 @@ ALL_COMBOS: list[tuple[int, int]] = [
 # Positive margin means reliably decoded; ≥30 dB suggests a nearby or high-power device.
 SF_SENSITIVITY = {7: -123, 8: -126, 9: -129, 10: -132, 11: -135, 12: -137}
 
+_EU868_CHANNEL_NAMES = {
+    868100000: "EU868 CH1", 868300000: "EU868 CH2", 868500000: "EU868 CH3",
+    867100000: "EU868 CH4", 867300000: "EU868 CH5", 867500000: "EU868 CH6",
+    867700000: "EU868 CH7", 867900000: "EU868 CH8",
+    869525000: "RX2 fixed channel",
+}
+
+_SF_BIT_RATE = {7: "5.47 kbps", 8: "3.13 kbps", 9: "1.76 kbps",
+                10: "0.98 kbps", 11: "0.54 kbps", 12: "0.29 kbps"}
+
+
+def _strip_markup(text: str) -> str:
+    """Remove Rich markup tags so clipboard text is plain."""
+    return re.sub(r'\[/?[^\[\]]*\]', '', text)
+
+
+def _copy_to_clipboard(text: str) -> str:
+    """
+    Write text to the system clipboard. Returns "" on success, or an
+    install-hint string on failure.
+
+    Textual's built-in copy_to_clipboard() sends an OSC 52 escape sequence
+    which many terminal emulators ignore; shelling out is more reliable.
+
+    - macOS  : pbcopy
+    - Windows: clip  (stdin must be UTF-16 LE with BOM — clip.exe's native encoding)
+    - Linux  : wl-copy (Wayland) → xclip → xsel (X11)
+    """
+    if sys.platform == "darwin":
+        candidates: list[tuple[list[str], str]] = [(["pbcopy"], "utf-8")]
+        missing_hint = "pbcopy not found (unexpected on macOS)"
+    elif sys.platform == "win32":
+        candidates = [(["clip"], "utf-16")]   # clip.exe expects UTF-16 LE + BOM
+        missing_hint = "clip not found (unexpected on Windows)"
+    else:
+        cmds: list[list[str]] = []
+        if os.environ.get("WAYLAND_DISPLAY"):
+            cmds.append(["wl-copy"])
+        if os.environ.get("DISPLAY"):
+            cmds += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+        if not cmds:
+            cmds = [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+        candidates = [(cmd, "utf-8") for cmd in cmds]
+        missing_hint = "install wl-clipboard (Wayland) or xclip / xsel (X11)"
+
+    for cmd, enc in candidates:
+        try:
+            subprocess.run(cmd, input=text.encode(enc), check=True,
+                           capture_output=True, timeout=2)
+            return ""
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            continue
+    return missing_hint
+
 
 def _link_margin(rssi: Optional[int], sf: int) -> Optional[int]:
     """Return RSSI minus the SF sensitivity floor, or None if RSSI is unknown."""
     if rssi is None:
         return None
     return rssi - SF_SENSITIVITY[sf]
+
+
+# ---------------------------------------------------------------------------
+# Packet detail helpers
+# ---------------------------------------------------------------------------
+
+def _lorawan_airtime_ms(payload_bytes: int, sf: int, bw_khz: int = 125) -> float:
+    """Estimate LoRaWAN packet airtime in ms (Semtech formula, CR=4/5, explicit header, CRC on)."""
+    de = 1 if (sf >= 11 and bw_khz == 125) else 0  # low data rate optimisation
+    t_sym = (2 ** sf) / (bw_khz * 1000)
+    t_preamble = (8 + 4.25) * t_sym
+    n_payload = 8 + max(
+        math.ceil((8 * payload_bytes - 4 * sf + 28 + 16) / (4 * (sf - 2 * de))) * 5, 0
+    )
+    return (t_preamble + n_payload * t_sym) * 1000
+
+
+def _format_packet_detail(pkt: PacketRecord) -> str:
+    """Return Rich-formatted detail + recon analysis text for a PacketRecord."""
+    lines: list[str] = []
+    lw = parse_lorawan(pkt.raw_hex) if pkt.raw_hex else {}
+
+    def section(title: str) -> None:
+        pad = "━" * max(0, 50 - len(title))
+        lines.append(f"\n[bold cyan]━━━ {title} {pad}[/bold cyan]")
+
+    def row(key: str, val: str, note: str = "") -> None:
+        note_s = f"  [dim]{note}[/dim]" if note else ""
+        lines.append(f"  [bold]{key:<22}[/bold] {val}{note_s}")
+
+    # ── RF Layer ─────────────────────────────────────────────────────────────
+    section("RF LAYER")
+    row("Frequency", f"{pkt.freq / 1e6:.3f} MHz", _EU868_CHANNEL_NAMES.get(pkt.freq, ""))
+    row("Spreading factor", f"SF{pkt.sf}", _SF_BIT_RATE.get(pkt.sf, ""))
+    row("Bandwidth / CR", f"{pkt.bw} kHz / 4/5")
+    row("IQ polarity", "inverted  (downlink)" if pkt.is_downlink else "normal  (uplink)")
+    if pkt.rssi is not None:
+        floor = SF_SENSITIVITY[pkt.sf]
+        margin = _link_margin(pkt.rssi, pkt.sf)
+        row("RSSI", f"{pkt.rssi} dBm", f"SF{pkt.sf} sensitivity floor: {floor} dBm")
+        if pkt.snr is not None:
+            snr_note = ("above noise floor" if pkt.snr >= 0
+                        else "below noise floor — spread-spectrum FEC active")
+            row("SNR", f"{pkt.snr} dB", snr_note)
+        if margin is not None:
+            if margin >= 20:
+                m_note = "very strong — device likely within tens to ~200 m"
+            elif margin >= 10:
+                m_note = "strong — probably within a few hundred metres"
+            elif margin >= 0:
+                m_note = "marginal — device at range or obstructed"
+            else:
+                m_note = "weak — at noise floor; FEC is working hard"
+            row("Link margin", f"{margin:+d} dB", m_note)
+    if pkt.raw_hex:
+        pl = len(pkt.raw_hex) // 2
+        airtime = _lorawan_airtime_ms(pl, pkt.sf)
+        duty = airtime / 36000  # % of 1% EU868 per-hour budget
+        row("Frame length", f"{pl} bytes")
+        row("Est. airtime", f"~{airtime:.0f} ms",
+            f"uses ~{duty:.3f}% of the 1% EU868 duty-cycle budget")
+
+    # ── LoRaWAN Frame ────────────────────────────────────────────────────────
+    section("LORAWAN FRAME")
+    row("Captured at", pkt.timestamp)
+    if pkt.raw_hex:
+        display_hex = pkt.raw_hex if len(pkt.raw_hex) <= 60 else pkt.raw_hex[:60] + "…"
+        row("Raw hex", display_hex)
+        row("MHDR byte", f"0x{pkt.raw_hex[:2]}")
+    mtype = pkt.mtype or "unknown"
+    direction = "↓ Network → Device (via gateway)" if pkt.is_downlink else "↑ Device → Network"
+    mtype_col = ("bright_magenta" if pkt.is_downlink
+                 else ("bright_green" if "Up" in mtype else "cyan"))
+    lines.append(f"  [bold]{'Message type':<22}[/bold] [{mtype_col}]{mtype}[/{mtype_col}]")
+    row("Direction", direction)
+
+    if pkt.dev_addr:
+        row("DevAddr", pkt.dev_addr,
+            "32-bit address — assigned at join (OTAA) or provisioned (ABP)")
+        if pkt.nwk_id:
+            row("NwkID", pkt.nwk_id, "upper 7 bits of DevAddr — identifies operator network")
+        if pkt.operator:
+            row("Operator hint", pkt.operator)
+        if pkt.fcnt is not None:
+            fcnt_note = ""
+            if pkt.fcnt < 10:
+                fcnt_note = "very low — device just joined or was reset"
+            elif pkt.fcnt > 60000:
+                fcnt_note = "high — long-running device or ABP provisioning"
+            row("FCnt (frame ctr)", str(pkt.fcnt), fcnt_note)
+        adr = lw.get("adr")
+        ack = lw.get("ack")
+        if adr is not None:
+            row("ADR flag", "ON" if adr else "OFF",
+                "network manages SF/TX power" if adr else "device uses fixed parameters")
+        if ack is not None:
+            row("ACK flag", "ON" if ack else "OFF",
+                "acknowledging a previous confirmed frame" if ack else "")
+
+    elif pkt.join_eui or pkt.dev_eui:
+        if pkt.join_eui:
+            row("JoinEUI / AppEUI", pkt.join_eui,
+                "identifies the application / network server")
+        if pkt.dev_eui:
+            row("DevEUI", pkt.dev_eui,
+                "globally unique device ID (like a MAC address)")
+            row("DevEUI OUI", pkt.dev_eui[:6],
+                "first 3 bytes — IEEE-registered manufacturer/vendor (lookup at ieee.org)")
+
+    if pkt.mac_commands:
+        section("MAC COMMANDS (FOpts)")
+        for cmd in pkt.mac_commands:
+            lines.append(f"  [yellow]▸[/yellow]  {cmd}")
+
+    # ── Recon Analysis ───────────────────────────────────────────────────────
+    section("RECONNAISSANCE ANALYSIS")
+    _add_recon_notes(pkt, lw, lines)
+
+    return "\n".join(lines)
+
+
+def _add_recon_notes(pkt: PacketRecord, lw: dict, lines: list[str]) -> None:
+    """Append reconnaissance analysis bullet points to lines."""
+
+    def note(text: str, col: str = "white") -> None:
+        lines.append(f"  [bold {col}]▸[/bold {col}]  {text}")
+
+    mtype = pkt.mtype or ""
+
+    if pkt.is_downlink:
+        note("Active gateway confirmed — this downlink was heard on RX2 (869.525 MHz / SF12).",
+             "bright_magenta")
+        note("Downlinks originate from a gateway, not from the end device.", "bright_magenta")
+        note("The gateway is likely within 1–3 km outdoors or in the same building.", "white")
+        if pkt.mac_commands:
+            note("MAC commands present → network server is actively controlling this device.",
+                 "yellow")
+        return
+
+    if "Join Request" in mtype:
+        note("OTAA join attempt — device is requesting to join a LoRaWAN network.", "yellow")
+        note("Join Request frames are NOT encrypted — DevEUI and JoinEUI are plaintext.",
+             "bright_red")
+        note("DevEUI is globally unique; the OUI (first 3 bytes) can identify the manufacturer.",
+             "white")
+        note("EU868 OTAA: device will try all 8 channels in sequence — watch other channels.",
+             "white")
+        note("If a Join Accept appears on RX2 (869.525 MHz / SF12) shortly after, join succeeded.",
+             "white")
+        return
+
+    if "Join Accept" in mtype:
+        note("Network accepted the join — device is being activated (OTAA).", "yellow")
+        note("Join Accept is AES-128 encrypted — DevAddr and session keys are not visible.", "dim")
+        note("Heard on RX2 → confirms an active gateway is nearby.", "bright_magenta")
+        return
+
+    if "Up" in mtype:
+        note("Regular uplink: device is sending sensor/application data to the network.",
+             "bright_green")
+        note("Payload is AES-128 encrypted — content is not recoverable without the AppSKey.",
+             "dim")
+        if pkt.fcnt is not None:
+            if pkt.fcnt < 10:
+                note(f"Low FCnt ({pkt.fcnt}): device recently joined (OTAA) or reset / "
+                     f"factory-provisioned (ABP).", "yellow")
+            elif pkt.fcnt > 60000:
+                note(f"High FCnt ({pkt.fcnt}): device has been running a long time without "
+                     f"reset — possibly critical infrastructure.", "white")
+        if lw.get("adr"):
+            note("ADR ON: network server is actively managing SF and TX power for this device.",
+                 "white")
+        if lw.get("ack"):
+            note("ACK set: confirming a previous confirmed downlink → bidirectional link active.",
+                 "white")
+        if pkt.mac_commands:
+            note("MAC commands in uplink → device is responding to network configuration requests.",
+                 "yellow")
+        if pkt.operator:
+            note(f"Operator hint: {pkt.operator}.", "white")
+
+    elif "Down" in mtype:
+        note("Downlink data frame: network server is sending data/commands to the device.",
+             "bright_magenta")
+        note("Downlink presence confirms an active gateway is within range.", "bright_magenta")
+
+    elif "Proprietary" in mtype or "RFU" in mtype:
+        note("Non-standard LoRaWAN frame — possibly a vendor-specific or private protocol.",
+             "yellow")
+        note("Some IoT devices (alarm panels, asset trackers, custom sensors) use proprietary "
+             "LoRa framing.", "white")
+        note("Raw payload may be decodable if the vendor protocol specification is known.", "white")
+
+    else:
+        note("Frame type not recognised — may be a malformed frame or non-LoRaWAN LoRa packet.",
+             "dim")
+
+    if pkt.rssi is not None:
+        margin = _link_margin(pkt.rssi, pkt.sf)
+        if margin is not None:
+            if margin >= 20:
+                note("Very strong link margin → device is probably close "
+                     "(< 200 m or same building).", "bright_green")
+            elif margin < 0:
+                note("Signal below sensitivity floor — decoded by LoRa FEC; "
+                     "device is at the range limit.", "yellow")
+        if pkt.rssi > -60:
+            note("Exceptionally high RSSI — consider a directional antenna to locate the device.",
+                 "white")
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +363,7 @@ class HardwareScanner:
     background thread — callers must use call_from_thread() to touch the UI."""
 
     RX2_PRESETS  = [1, 2, 5, 10, 20]  # available RX2 check intervals (hops)
+    _rx_overhead = 0.5                 # extra seconds after dwell for command latency; patch to 0 in tests
 
     def __init__(self, unit: LoRaUnit):
         self.unit = unit
@@ -176,7 +454,7 @@ class HardwareScanner:
         self.unit.start_rx()                      # continuous (65534); stop_rx() ends the window
         # Read in 0.2 s increments so stop_event is checked every tick
         lines: list[str] = []
-        deadline = time.monotonic() + dwell + 0.5
+        deadline = time.monotonic() + dwell + self._rx_overhead
         old_timeout = self.unit.ser.timeout
         self.unit.ser.timeout = 0.2
         while time.monotonic() < deadline and not self._stop.is_set():
@@ -219,6 +497,7 @@ class SweepScreen(Screen):
         Binding("r", "reset",            "Reset stats",    show=True),
         Binding("l", "lock_single",      "Lock freq+SF",   show=True),
         Binding("i", "cycle_rx2",        "RX2 interval",   show=True),
+        Binding("c", "copy",             "Copy row",       show=True),
         Binding("q", "app.quit",         "Quit",           show=True),
     ]
 
@@ -362,6 +641,28 @@ class SweepScreen(Screen):
         self._scanner.rx2_interval = nxt
         self.notify(f"RX2 check every {nxt} hops", timeout=2)
 
+    def action_copy(self) -> None:
+        t = self.query_one("#sw_table", DataTable)
+        idx = t.cursor_row
+        if 0 <= idx < len(ALL_COMBOS):
+            freq, sf = ALL_COMBOS[idx]
+        elif idx == len(ALL_COMBOS):
+            freq, sf = RX2_FREQ, RX2_SF
+        else:
+            return
+        s = self._state[(freq, sf)]
+        margin_str = f"{s['margin']:+d} dB" if s['margin'] is not None else "—"
+        text = (
+            f"Freq: {freq/1e6:.3f} MHz  SF: SF{sf}\n"
+            f"Pkts: {s['pkts']}  RSSI: {s['rssi']} dBm  SNR: {s['snr']} dB  Margin: {margin_str}\n"
+            f"DevAddr: {s['addr']}  Last seen: {s['ts']}"
+        )
+        err = _copy_to_clipboard(text)
+        if err:
+            self.notify(f"Clipboard failed — {err}", severity="error", timeout=5)
+        else:
+            self.notify("Row copied to clipboard", timeout=2)
+
     def action_reset(self) -> None:
         self._current = None
         for combo in self._state:
@@ -404,6 +705,7 @@ class LockScreen(Screen):
     BINDINGS = [
         Binding("escape", "back",       "Back to sweep",  show=True),
         Binding("i",      "cycle_rx2",  "RX2 interval",   show=True),
+        Binding("c",      "copy",       "Copy packet",    show=True),
         Binding("q",      "app.quit",   "Quit",           show=True),
     ]
 
@@ -541,7 +843,23 @@ class LockScreen(Screen):
             lines.append("   ".join(parts))
         stats.update("\n".join(lines))
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on a packet row: push PacketDetailScreen for that packet."""
+        idx = event.cursor_row
+        if 0 <= idx < len(self._pkts):
+            self.app.push_screen(PacketDetailScreen(self._pkts, idx))
+
     # ---- action ------------------------------------------------------------
+
+    def action_copy(self) -> None:
+        t = self.query_one("#pkt_table", DataTable)
+        idx = t.cursor_row
+        if 0 <= idx < len(self._pkts):
+            err = _copy_to_clipboard(_strip_markup(_format_packet_detail(self._pkts[idx])))
+            if err:
+                self.notify(f"Clipboard failed — {err}", severity="error", timeout=5)
+            else:
+                self.notify("Packet detail copied to clipboard", timeout=2)
 
     def action_cycle_rx2(self) -> None:
         presets = HardwareScanner.RX2_PRESETS
@@ -553,6 +871,93 @@ class LockScreen(Screen):
     def action_back(self) -> None:
         self._scanner.stop()
         self.app.pop_screen()  # on_show on SweepScreen restarts sweep
+
+
+# ---------------------------------------------------------------------------
+# Packet Detail Screen
+# ---------------------------------------------------------------------------
+class PacketDetailScreen(Screen):
+    """Full decode + reconnaissance analysis for a single captured packet."""
+
+    CSS = """
+    PacketDetailScreen {
+        layout: vertical;
+    }
+    #pd_header {
+        height: 1;
+        background: $accent-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
+    #pd_scroll {
+        height: 1fr;
+    }
+    #pd_body {
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "back",     "Back to lock",   show=True),
+        Binding("left",   "prev_pkt", "← Prev packet",  show=True),
+        Binding("right",  "next_pkt", "→ Next packet",  show=True),
+        Binding("c",      "copy",     "Copy detail",    show=True),
+        Binding("q",      "app.quit", "Quit",           show=True),
+    ]
+
+    def __init__(self, pkts: list[PacketRecord], idx: int):
+        super().__init__()
+        self._pkts = pkts
+        self._idx = idx
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Static("", id="pd_header")
+        yield VerticalScroll(
+            Static("", id="pd_body"),
+            id="pd_scroll",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._refresh_detail()
+
+    def _refresh_detail(self) -> None:
+        if not self._pkts:
+            return
+        pkt = self._pkts[self._idx]
+        try:
+            self.query_one("#pd_header", Static).update(
+                f"Packet {self._idx + 1} of {len(self._pkts)}"
+                f"  —  {pkt.timestamp}"
+                f"  |  ← → navigate  |  [Esc] back to lock"
+            )
+            self.query_one("#pd_body", Static).update(_format_packet_detail(pkt))
+            self.query_one("#pd_scroll", VerticalScroll).scroll_home(animate=False)
+        except Exception:
+            pass
+
+    def action_copy(self) -> None:
+        if not self._pkts:
+            return
+        err = _copy_to_clipboard(_strip_markup(_format_packet_detail(self._pkts[self._idx])))
+        if err:
+            self.notify(f"Clipboard failed — {err}", severity="error", timeout=5)
+        else:
+            self.notify("Copied to clipboard", timeout=2)
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_prev_pkt(self) -> None:
+        if self._idx > 0:
+            self._idx -= 1
+            self._refresh_detail()
+
+    def action_next_pkt(self) -> None:
+        if self._idx < len(self._pkts) - 1:
+            self._idx += 1
+            self._refresh_detail()
 
 
 # ---------------------------------------------------------------------------
