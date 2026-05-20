@@ -20,6 +20,7 @@ from lora_tui import (
     HardwareScanner,
     SweepScreen,
     LockScreen,
+    MeshtasticScreen,
     PacketDetailScreen,
     LoRaTUIApp,
     ALL_COMBOS,
@@ -29,6 +30,7 @@ from lora_tui import (
     _lorawan_airtime_ms,
     _format_packet_detail,
 )
+from lora_recon import MESHTASTIC_SYNCWORD, LORAWAN_SYNCWORD, MESHTASTIC_EU_PRESETS
 from textual.widgets import DataTable, Static
 
 
@@ -183,7 +185,7 @@ class TestHardwareScanner:
 
         original_configure = s.unit.configure_p2p
 
-        def tracking_configure(freq, sf):
+        def tracking_configure(freq, sf, **kwargs):
             seen_freqs.add(freq)
             if all(ch in seen_freqs for ch in EU868_CHANNELS):
                 done.set()
@@ -296,7 +298,7 @@ class TestHardwareScanner:
         seen_freqs = []
         done = threading.Event()
 
-        def tracking_configure(freq, sf):
+        def tracking_configure(freq, sf, **kwargs):
             seen_freqs.append(freq)
             if len(seen_freqs) >= 3:
                 done.set()
@@ -1138,3 +1140,451 @@ async def test_detail_screen_q_quits():
         await pilot.pause(0.2)
         assert isinstance(app.screen, PacketDetailScreen)
         await pilot.press("q")
+
+
+# ---------------------------------------------------------------------------
+# New-field rendering in _format_packet_detail
+# ---------------------------------------------------------------------------
+class TestFormatPacketDetailNewFields:
+    def _uplink_base(self):
+        # Helper — TTN-style data uplink with no extra fields
+        return PacketRecord(
+            timestamp="2024-01-15T12:34:56+00:00",
+            freq=868100000, sf=7, bw=125,
+            rssi=-90, snr=5,
+            raw_hex="40341234000000AA",
+            mtype="Unconfirmed Data Up",
+            dev_addr="260B1234", nwk_id="0x13", fcnt=10,
+            operator="TTN (The Things Network)",
+        )
+
+    def test_join_request_shows_vendor(self):
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=868100000, sf=7, bw=125, rssi=-80, snr=7,
+            raw_hex="00" + "01"*8 + "00"*8 + "0000" + "AABBCCDD",
+            mtype="Join Request",
+            join_eui="0102030405060708",
+            dev_eui="A84041AABBCCDD00",
+            dev_eui_vendor="Dragino",
+            dev_nonce=0x0042,
+        )
+        text = _format_packet_detail(pkt)
+        assert "DevEUI vendor" in text
+        assert "Dragino" in text
+        assert "DevNonce" in text
+        assert "0x0042" in text
+
+    def test_multicast_flag_rendered(self):
+        pkt = self._uplink_base()
+        pkt.dev_addr = "FF000001"
+        pkt.is_multicast = True
+        text = _format_packet_detail(pkt)
+        assert "Multicast" in text
+        assert "FF000000" in text
+
+    def test_retransmit_note_in_recon(self):
+        pkt = self._uplink_base()
+        pkt.is_retransmit = True
+        text = _format_packet_detail(pkt)
+        assert "Retransmission" in text
+
+    def test_replay_alert_renders_security_section(self):
+        pkt = self._uplink_base()
+        pkt.replay_alert = "FCnt regression for 260B1234: 1000 → 5"
+        text = _format_packet_detail(pkt)
+        assert "SECURITY ALERT" in text
+        assert "regression" in text
+
+    def test_beacon_section_rendered(self):
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=869525000, sf=9, bw=125, rssi=-100, snr=2,
+            raw_hex="00" * 17,
+            mtype="Class B Beacon",
+            is_downlink=True, is_beacon=True,
+            beacon={"utc": "2026-01-01T00:00:00+00:00",
+                    "gps_seconds": 1_400_000_000,
+                    "crc1": 0x1234, "crc2": 0xABCD,
+                    "info_desc": 1, "gw_info": "01AABBCCDDEEFF"},
+        )
+        text = _format_packet_detail(pkt)
+        assert "CLASS B BEACON" in text
+        assert "time-synchronised" in text
+        assert "2026-01-01" in text
+
+    def test_meshtastic_section_rendered(self):
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=869525000, sf=11, bw=250, rssi=-85, snr=4,
+            raw_hex="00" * 16,
+            mtype="Meshtastic",
+            is_meshtastic=True,
+            meshtastic={"src": "DEADBEEF", "dst": "FFFFFFFF",
+                        "packet_id": 0x12345678, "hop_limit": 2,
+                        "want_ack": True, "via_mqtt": False,
+                        "channel_hash": 0x08},
+        )
+        text = _format_packet_detail(pkt)
+        assert "MESHTASTIC HEADER" in text
+        assert "DEADBEEF" in text
+        assert "FFFFFFFF" in text
+
+    def test_lpp_section_rendered(self):
+        pkt = self._uplink_base()
+        pkt.lpp_sensors = ["ch1 temperature=23.5C", "ch2 humidity=46.5%"]
+        text = _format_packet_detail(pkt)
+        assert "CAYENNE LPP" in text
+        assert "23.5C" in text
+        assert "46.5%" in text
+        # And the recon note should also flag plaintext
+        assert "isn't encrypting" in text
+
+    def test_helium_operator_shown(self):
+        # Type-6 NetID DevAddr (Helium): 0xFC0014C1 → 11111100_0000... = Type 6, NwkID 0x53?
+        # Recompute: top 7 bits 1111110, then 15 bits NwkID, then 10 bits addr.
+        # We just check the operator string flows through to the detail.
+        pkt = self._uplink_base()
+        pkt.operator = "Helium"
+        pkt.netid_type = 6
+        text = _format_packet_detail(pkt)
+        assert "Helium" in text
+
+
+# ---------------------------------------------------------------------------
+# _make_pkt with the new flags
+# ---------------------------------------------------------------------------
+class TestMakePktNewModes:
+    def test_meshtastic_mode_skips_lorawan_parse(self):
+        # Bytes are LE on the wire; hex bytes "EFBEADDE" → unpacked LE → 0xDEADBEEF
+        import struct
+        dst = struct.pack("<I", 0xFFFFFFFF)
+        src = struct.pack("<I", 0xDEADBEEF)
+        pid = struct.pack("<I", 0x12345678)
+        flags = bytes([0x08])
+        chh   = bytes([0x42])
+        evt = {"rssi": -80, "snr": 5,
+               "raw_hex": (dst + src + pid + flags + chh + b"\x00\x00").hex().upper()}
+        pkt = _make_pkt(evt, 869525000, 11, bw=250, is_meshtastic=True)
+        assert pkt.is_meshtastic is True
+        assert pkt.mtype == "Meshtastic"
+        assert pkt.meshtastic is not None
+        assert pkt.meshtastic["src"] == "DEADBEEF"
+        assert pkt.meshtastic["dst"] == "FFFFFFFF"
+
+    def test_beacon_mode_uses_beacon_parser(self):
+        # 17-byte beacon
+        raw = ("0000" + "0094357D" + "1234" + "01AABBCCDDEEFF" + "ABCD").upper()
+        evt = {"rssi": -100, "snr": 2, "raw_hex": raw}
+        pkt = _make_pkt(evt, 869525000, 9, bw=125, is_beacon=True)
+        assert pkt.is_beacon is True
+        assert pkt.is_downlink is True
+        assert pkt.mtype == "Class B Beacon"
+        assert pkt.beacon is not None
+        assert pkt.beacon["info_desc"] == 0x01
+
+    def test_uplink_populates_new_fields(self):
+        # Join request with Dragino DevEUI
+        join_eui_le = bytes([0x01]*8)
+        dev_eui_le  = bytes([0x55, 0x44, 0x33, 0x22, 0x11, 0x41, 0x40, 0xA8])
+        frame = (bytes([0x00]) + join_eui_le + dev_eui_le
+                 + b"\x42\x00"      # DevNonce 0x0042
+                 + b"\xAA\xBB\xCC\xDD")
+        evt = {"rssi": -80, "snr": 7, "raw_hex": frame.hex().upper()}
+        pkt = _make_pkt(evt, 868100000, 7)
+        assert pkt.dev_nonce == 0x0042
+        assert pkt.dev_eui_vendor == "Dragino"
+        assert pkt.is_meshtastic is False
+        assert pkt.is_beacon is False
+
+
+# ---------------------------------------------------------------------------
+# CLI argparse for new flags
+# ---------------------------------------------------------------------------
+class TestTUICLI:
+    def test_beacon_interval_flag(self):
+        from lora_tui import build_parser
+        args = build_parser().parse_args(["--beacon-interval", "5"])
+        assert args.beacon_interval == 5
+
+    def test_replay_state_flag(self):
+        from lora_tui import build_parser
+        args = build_parser().parse_args(["--replay-state", "/tmp/r.json"])
+        assert args.replay_state == "/tmp/r.json"
+
+    def test_defaults(self):
+        from lora_tui import build_parser
+        args = build_parser().parse_args([])
+        assert args.beacon_interval == 0
+        assert args.replay_state is None
+
+    def test_meshtastic_flag(self):
+        from lora_tui import build_parser
+        args = build_parser().parse_args(["--meshtastic"])
+        assert args.meshtastic is True
+        assert args.meshtastic_preset == "LongFast"
+
+    def test_meshtastic_preset_choices(self):
+        from lora_tui import build_parser
+        args = build_parser().parse_args(["--meshtastic", "--meshtastic-preset", "LongSlow"])
+        assert args.meshtastic_preset == "LongSlow"
+
+
+# ---------------------------------------------------------------------------
+# HardwareScanner.start_meshtastic
+# ---------------------------------------------------------------------------
+class TestStartMeshtastic:
+    def _scanner(self, readline_lines=None):
+        s = HardwareScanner(_mock_unit(readline_lines or []))
+        s._rx_overhead = 0
+        return s
+
+    def test_unknown_preset_raises(self):
+        s = self._scanner()
+        with pytest.raises(ValueError):
+            s.start_meshtastic("Bogus", on_packet=lambda p: None)
+
+    def test_sets_sync_word_on_entry(self):
+        s = self._scanner()
+        sync_calls = []
+        s.unit.set_syncword = lambda w: sync_calls.append(w) or True
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_meshtastic("LongFast", on_packet=lambda p: None)
+            # Let one loop iteration happen, then stop
+            time.sleep(0.1)
+            s.stop()
+        # The Meshtastic sync word was set at least once
+        assert MESHTASTIC_SYNCWORD in sync_calls
+
+    def test_restores_lorawan_sync_on_stop(self):
+        s = self._scanner()
+        sync_calls = []
+        s.unit.set_syncword = lambda w: sync_calls.append(w) or True
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_meshtastic("LongFast", on_packet=lambda p: None)
+            time.sleep(0.1)
+            s.stop()
+        # Last call should restore the LoRaWAN sync word
+        assert sync_calls[-1] == LORAWAN_SYNCWORD
+
+    def test_configures_preset_frequency(self):
+        s = self._scanner()
+        cp_calls = []
+        s.unit.set_syncword = lambda w: True
+        original_cp = s.unit.configure_p2p
+        def trace_cp(freq, sf, **kwargs):
+            cp_calls.append((freq, sf, kwargs.get("bw", 125)))
+            return original_cp(freq, sf, **kwargs)
+        s.unit.configure_p2p = trace_cp
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_meshtastic("LongFast", on_packet=lambda p: None)
+            time.sleep(0.1)
+            s.stop()
+        assert cp_calls, "configure_p2p was never called"
+        freq, sf, bw = cp_calls[0]
+        assert (freq, sf, bw) == MESHTASTIC_EU_PRESETS["LongFast"]
+
+    def test_delivers_meshtastic_packet(self):
+        # Build a Meshtastic frame and feed it as an RXP2P event
+        import struct
+        frame = (struct.pack("<I", 0xFFFFFFFF)        # dst
+                 + struct.pack("<I", 0xDEADBEEF)       # src
+                 + struct.pack("<I", 0x12345678)       # packet_id
+                 + bytes([0x08, 0x42, 0x00, 0x00]))
+        lines = [f"+EVT:RXP2P:-90:5:{frame.hex().upper()}"]
+
+        s = self._scanner(readline_lines=lines)
+        s.unit.set_syncword = lambda w: True
+        got = []
+        stop = threading.Event()
+        def on_pkt(p):
+            got.append(p)
+            stop.set()
+
+        with patch.dict(lora_recon.SF_DWELL, FAST_DWELL):
+            s.start_meshtastic("LongFast", on_packet=on_pkt)
+            stop.wait(timeout=5)
+            s.stop()
+        assert got
+        assert got[0].is_meshtastic is True
+        assert got[0].meshtastic["src"] == "DEADBEEF"
+
+
+# ---------------------------------------------------------------------------
+# SweepScreen `M` key pushes MeshtasticScreen
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_sweep_screen_m_key_pushes_meshtastic_screen():
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.05)
+        # Stop the LoRaWAN sweep scanner so it doesn't race with the test
+        app._scanner.stop()
+        # Press M
+        await pilot.press("m")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, MeshtasticScreen)
+        # Cleanup before fixture tears down
+        app._scanner.stop()
+
+
+@pytest.mark.asyncio
+async def test_meshtastic_screen_esc_returns_to_sweep():
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.05)
+        app._scanner.stop()
+        await pilot.press("m")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, MeshtasticScreen)
+        await pilot.press("escape")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, SweepScreen)
+        app._scanner.stop()
+
+
+@pytest.mark.asyncio
+async def test_meshtastic_screen_renders_packet():
+    """A Meshtastic packet posted to the screen appears in its table."""
+    app, _ = _make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.05)
+        app._scanner.stop()
+        await pilot.press("m")
+        await pilot.pause(0.1)
+        screen = app.screen
+        assert isinstance(screen, MeshtasticScreen)
+        # Stop the meshtastic loop so it doesn't compete with our direct call
+        app._scanner.stop()
+
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=869525000, sf=11, bw=250, rssi=-85, snr=4,
+            raw_hex="00" * 16,
+            mtype="Meshtastic", is_meshtastic=True,
+            meshtastic={"src": "DEADBEEF", "dst": "FFFFFFFF",
+                        "packet_id": 0x12345678, "hop_limit": 2,
+                        "want_ack": True, "via_mqtt": False,
+                        "channel_hash": 0x08},
+        )
+        screen._on_packet(pkt)
+        await pilot.pause(0.05)
+        t = screen.query_one("#mt_table", DataTable)
+        assert t.row_count == 1
+
+
+# ---------------------------------------------------------------------------
+# CLI --meshtastic flag wires through to the App
+# ---------------------------------------------------------------------------
+def test_app_start_meshtastic_attribute():
+    """LoRaTUIApp accepts start_meshtastic and stores it for on_mount."""
+    mock_unit = MagicMock(spec=LoRaUnit)
+    app = LoRaTUIApp(mock_unit, "v=test", start_meshtastic=True)
+    assert app._start_meshtastic is True
+
+    app2 = LoRaTUIApp(mock_unit, "v=test")
+    assert app2._start_meshtastic is False
+
+
+# ---------------------------------------------------------------------------
+# Receiver / hardware section in the detail screen
+# ---------------------------------------------------------------------------
+class TestHardwareSection:
+    def _pkt(self) -> PacketRecord:
+        return PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=868100000, sf=7, bw=125, rssi=-80, snr=7,
+            raw_hex="40341234000000AA",
+            mtype="Unconfirmed Data Up",
+            dev_addr="260B1234", nwk_id="0x13", fcnt=10,
+        )
+
+    def test_no_hardware_info_means_no_section(self):
+        text = _format_packet_detail(self._pkt())
+        assert "RECEIVER / HARDWARE" not in text
+
+    def test_hardware_info_renders_section(self):
+        hw = {
+            "module":   "M5Stack Unit LoRaWAN-EU868 (RAK3172 / STM32WLE5)",
+            "version":  "RUI_4.0.5_RAK3172",
+            "dev_eui":  "A8404118273645FF",
+            "port":     "/dev/ttyUSB0",
+            "baudrate": 115200,
+            "region":   "EU868",
+        }
+        text = _format_packet_detail(self._pkt(), hardware_info=hw)
+        assert "RECEIVER / HARDWARE" in text
+        assert "RAK3172" in text
+        assert "RUI_4.0.5_RAK3172" in text
+        assert "A8404118273645FF" in text
+        assert "/dev/ttyUSB0" in text
+        assert "115200" in text
+        assert "EU868" in text
+
+    def test_hardware_section_does_vendor_lookup_on_receiver_eui(self):
+        hw = {"dev_eui": "A8404100112233AA"}      # Dragino OUI
+        text = _format_packet_detail(self._pkt(), hardware_info=hw)
+        assert "Dragino" in text
+
+    def test_unavailable_dev_eui_is_skipped(self):
+        hw = {"version": "test", "dev_eui": "–"}   # P2P-mode placeholder
+        text = _format_packet_detail(self._pkt(), hardware_info=hw)
+        assert "RECEIVER / HARDWARE" in text
+        assert "test" in text
+        # The "Receiver DevEUI" row should NOT appear for the "–" placeholder
+        assert "Receiver DevEUI" not in text
+
+    def test_empty_hardware_info_still_safe(self):
+        # An empty dict is falsy → no section shown
+        text = _format_packet_detail(self._pkt(), hardware_info={})
+        assert "RECEIVER / HARDWARE" not in text
+
+
+# ---------------------------------------------------------------------------
+# Improved Unknown-operator hint
+# ---------------------------------------------------------------------------
+class TestUnknownOperatorHint:
+    def test_unknown_operator_shows_netid_and_registry_pointer(self):
+        # NwkID 0x08 (DevAddr 0x10000000 → top 7 bits = 0x08)
+        # Build a real frame so the detail screen parses it the same way the TUI does
+        import struct
+        from lora_recon import parse_lorawan
+        da = struct.pack("<I", 0x10000001)
+        frame = bytes([0x60]) + da + bytes([0x00, 0x00, 0x00])
+        r = parse_lorawan(frame.hex())
+        # Sanity: it's still Type 0 with NwkID 0x08
+        assert r["netid_type"] == 0
+        assert r["nwk_id"] == "0x08"
+        assert r["operator_hint"].startswith("Unknown commercial operator")
+        assert "0x000008" in r["operator_hint"]
+        assert "LoRa Alliance" in r["operator_hint"]
+
+    def test_known_operator_unchanged(self):
+        from lora_recon import parse_lorawan
+        import struct
+        da = struct.pack("<I", 0x26000001)             # NwkID 0x13 (TTN)
+        frame = bytes([0x40]) + da + bytes([0x00, 0x00, 0x00, 0xAA])
+        r = parse_lorawan(frame.hex())
+        assert r["operator_hint"] == "TTN (The Things Network)"
+
+    def test_unknown_operator_in_detail_screen(self):
+        # End-to-end: a downlink with NwkID 0x08 renders the new hint text
+        import struct
+        from lora_recon import parse_lorawan
+        da = struct.pack("<I", 0x10000001)
+        raw = (bytes([0x60]) + da + bytes([0x00, 0x00, 0x00])).hex().upper()
+        lw = parse_lorawan(raw)
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=869525000, sf=12, bw=125, rssi=-101, snr=-7,
+            raw_hex=raw,
+            mtype=lw["mtype"], dev_addr=lw["dev_addr"], nwk_id=lw["nwk_id"],
+            netid_type=lw["netid_type"], operator=lw["operator_hint"],
+            is_downlink=True,
+        )
+        text = _format_packet_detail(pkt)
+        assert "0x000008" in text
+        assert "LoRa Alliance" in text

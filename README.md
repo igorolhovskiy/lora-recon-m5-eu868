@@ -47,6 +47,10 @@ python lora_recon.py [options]
 | `--lock-duration MIN` | 10.0 | How long to stay in lock mode (minutes) |
 | `--freq-hop` | off | Lock mode: hop all 8 EU868 channels at the fixed SF instead of staying on one frequency |
 | `--rx2-interval N` | 10 | Check RX2 downlink channel every N hops |
+| `--beacon-interval N` | 0 | Check 869.525 MHz / SF9 for Class B beacons every N hops (0 disables) |
+| `--meshtastic` | off | Switch to Meshtastic mode (sync word 0x2B) — uses `--meshtastic-preset` instead of LoRaWAN sweep/lock |
+| `--meshtastic-preset NAME` | LongFast | Meshtastic EU preset: `LongFast`, `LongSlow`, `VLongSlow`, `MediumFast`, `ShortFast` |
+| `--replay-state PATH` | — | JSON file to persist DevNonce / FCnt history across runs for replay-attack alerts |
 | `--output BASENAME` | — | Save results to `BASENAME.json` + `BASENAME.csv` |
 | `--dedup-window SEC` | 30.0 | Suppress duplicate `(DevAddr, FCnt)` within this window |
 | `--verbose` | off | Debug-level logging |
@@ -66,6 +70,15 @@ python lora_recon.py --sweep-only
 
 # Jump straight to a known active combo, hopping all channels at SF7
 python lora_recon.py --lock-freq 868100000 --lock-sf 7 --freq-hop --lock-duration 30
+
+# Interleave Class B beacon checks every 8 sweep hops
+python lora_recon.py --beacon-interval 8
+
+# Track replay attacks across runs (sidecar persists DevNonce + FCnt history)
+python lora_recon.py --replay-state recon_state.json
+
+# Switch the radio to Meshtastic LongFast and listen on 869.525 MHz SF11 BW250
+python lora_recon.py --meshtastic
 ```
 
 ### Two-phase operation
@@ -99,8 +112,21 @@ One full sweep pass takes approximately **400 s (≈ 6.7 min)**. If you already 
 ## TUI usage — `lora_tui.py`
 
 ```bash
-python lora_tui.py [--port /dev/ttyUSB0] [--baudrate 115200]
+python lora_tui.py [--port /dev/ttyUSB0] [--baudrate 115200] \
+                   [--beacon-interval N] [--replay-state PATH] \
+                   [--meshtastic] [--meshtastic-preset PRESET]
 ```
+
+Optional flags:
+
+| Option | Description |
+|---|---|
+| `--beacon-interval N` | Listen for Class B beacons every N sweep/lock cycles |
+| `--replay-state PATH` | JSON file persisting DevNonce / FCnt history across runs — alerts on replay |
+| `--meshtastic` | Boot directly into the Meshtastic screen (sync word 0x2B) — bypasses the LoRaWAN sweep |
+| `--meshtastic-preset NAME` | EU Meshtastic preset: `LongFast` (default), `LongSlow`, `VLongSlow`, `MediumFast`, `ShortFast` |
+
+The Sweep screen also accepts `M` at runtime to jump into Meshtastic capture without restarting; pressing `Esc` from the Meshtastic screen restores the LoRaWAN sync word and returns to the sweep.
 
 ### Sweep screen
 
@@ -129,6 +155,7 @@ The sweep checks the RX2 channel (IQINVER=1, correct polarity for downlinks) eve
 | ↑ / ↓ | Navigate rows |
 | Enter | **SF-hop lock** — fix SF from selected row, hop all 8 EU868 channels |
 | L | **Single lock** — fix both frequency and SF from selected row |
+| M | **Meshtastic mode** — switch sync word to 0x2B and capture on the configured preset |
 | I | Cycle RX2 check interval (1 / 2 / 5 / 10 / 20 hops) |
 | R | Reset all statistics |
 | C | Copy selected row to clipboard |
@@ -177,12 +204,16 @@ Press **Enter** on any row in the lock view to open the full packet decode and r
 
 ![Packet detail screen](screenshots/packet_detail.svg)
 
-The detail screen shows four sections:
+The detail screen shows the following sections (later sections appear only when relevant):
 
 - **RF LAYER** — frequency, SF, bandwidth, IQ polarity, RSSI, SNR, link margin, frame length, and estimated airtime with EU868 duty-cycle impact.
-- **LORAWAN FRAME** — timestamp, raw hex, MHDR message type, direction, DevAddr / NwkID / operator / FCnt / ADR+ACK flags (data frames), or JoinEUI / DevEUI / OUI (join requests).
-- **MAC COMMANDS (FOpts)** — decoded MAC command list, shown only when FOpts are present.
-- **RECONNAISSANCE ANALYSIS** — plain-English interpretation: what the frame type reveals, signal strength assessment, device proximity estimate, and ADR / ACK / FCnt observations.
+- **LORAWAN FRAME** — timestamp, raw hex, MHDR message type, direction, DevAddr / NwkID / NetID type / operator / FCnt / ADR+ACK flags (data frames), or JoinEUI / DevEUI / OUI / DevEUI vendor / DevNonce (join requests).
+- **SECURITY ALERT** — DevNonce replay or FCnt regression for a tracked device.
+- **CLASS B BEACON** — beacon GPS time, GwSpecific bytes, and CRCs when a beacon frame is decoded.
+- **MESHTASTIC HEADER** — source / destination node IDs, packet ID, hop limit, want-ACK and via-MQTT flags, channel hash.
+- **CAYENNE LPP DECODE** — sensor readings (temperature, humidity, GPS, etc.) decoded from plaintext FRMPayload on private-NetID uplinks.
+- **MAC COMMANDS (FOpts)** — decoded MAC command list (LoRaWAN 1.0.x only).
+- **RECONNAISSANCE ANALYSIS** — plain-English interpretation: what the frame type reveals, signal strength assessment, retransmit / multicast / replay notes, and ADR / ACK / FCnt observations.
 
 **Packet detail controls:**
 
@@ -205,21 +236,40 @@ The detail screen shows four sections:
 | `snr` | Signal-to-noise ratio. Positive = good link budget |
 | `mtype` | LoRaWAN message type from MHDR (Unconfirmed Data Up, Join Request, …) |
 | `dev_addr` | 4-byte DevAddr in hex (data frames); absent on join requests |
-| `nwk_id` | Upper 7 bits of DevAddr — identifies the network operator |
-| `operator` | Best-effort operator guess from NwkID |
+| `nwk_id` | NwkID extracted per NetID Type (6–17 bits depending on Type 0–7) |
+| `netid_type` | NetID Type 0..7 per LoRaWAN spec — identifies how the DevAddr is partitioned |
+| `operator` | Best-effort operator name from the (NetID type, NwkID) lookup table |
 | `fcnt` | Frame counter (uplinks only) — monotonically increasing; gaps mean missed packets |
 | `is_downlink` | `true` for packets on RX2 (gateway → device direction) |
+| `is_multicast` | `true` for DevAddrs in the conventional FUOTA/Class C range (≥ 0xFF000000) |
+| `is_retransmit` | `true` when the same (DevAddr, FCnt) was seen within the retransmit window |
+| `is_beacon` | `true` for Class B beacon frames decoded on 869.525 MHz / SF9 |
+| `is_meshtastic` | `true` when the radio was in Meshtastic mode for this capture |
+| `dev_nonce` | 16-bit join-request nonce; tracked for replay-attack detection |
+| `dev_eui_vendor` / `join_eui_vendor` | Curated OUI lookup of the EUI prefix (LoRa vendors + IEEE MA-S sub-allocations) |
+| `replay_alert` | Set when DevNonce repeats for a DevEUI, or FCnt regresses for a DevAddr |
+| `lpp_sensors` | Decoded Cayenne LPP sensor readings (only attempted on private-NetID uplinks) |
+| `beacon` | Class B beacon decode (GPS time, GwSpecific, CRCs) |
+| `meshtastic` | Meshtastic header decode (src/dst/packet_id/flags/channel_hash) |
 | `mac_commands` | Decoded MAC commands from FOpts (LoRaWAN 1.0.x only — unencrypted) |
 
-### Operator identification from NwkID
+### Operator identification
 
-| NwkID | Operator |
-|---|---|
-| 0x00 | Private / ChirpStack |
-| 0x13 (19) | The Things Network |
-| 0x24 (36) | Actility / ThingPark |
+Operators are looked up by `(NetID Type, NwkID)`. The bundled table includes:
 
-Other values indicate other commercial or private networks.
+| NetID Type | NwkID | Operator |
+|---|---|---|
+| 0 | 0x00 | Private / ChirpStack |
+| 0 | 0x01 | Experimental |
+| 0 | 0x13 | The Things Network |
+| 0 | 0x24 | Actility / ThingPark |
+| 6 | 0x0053 | Helium |
+
+Extend `NETID_OPERATORS` in `lora_recon.py` to add more — the LoRa Alliance allocates new NetIDs periodically.
+
+### Vendor identification
+
+`OUI_VENDORS` in `lora_recon.py` maps DevEUI / JoinEUI prefixes to manufacturers using a longest-match lookup (24-bit IEEE OUI, plus 36-bit IEEE MA-S sub-allocations under the heavily-shared `70:B3:D5` block). Bundled vendors include Dragino, Adeunis, Browan/Compal, Milesight, RAK, Kerlink, Tektelic, Sagemcom, Bosch, Sensative, Abeeway, Microchip, ST, Multi-Tech, Murata, and Semtech.
 
 ### MAC commands (FOpts)
 

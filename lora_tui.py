@@ -45,8 +45,12 @@ from textual.binding import Binding
 
 from lora_recon import (
     LoRaUnit, DeduplicationCache,
-    parse_events, parse_lorawan, PacketRecord,
+    parse_events, parse_lorawan, parse_beacon, parse_meshtastic,
+    lookup_vendor, lookup_operator, parse_netid,
+    PacketRecord, RetransmissionTracker, ReplayTracker,
     EU868_CHANNELS, RX2_FREQ, RX2_SF, SPREADING_FACTORS, SF_DWELL,
+    BEACON_FREQ_EU868, BEACON_SF, BEACON_BW,
+    LORAWAN_SYNCWORD, MESHTASTIC_SYNCWORD, MESHTASTIC_EU_PRESETS,
     auto_detect_port,
 )
 
@@ -137,8 +141,19 @@ def _lorawan_airtime_ms(payload_bytes: int, sf: int, bw_khz: int = 125) -> float
     return (t_preamble + n_payload * t_sym) * 1000
 
 
-def _format_packet_detail(pkt: PacketRecord) -> str:
-    """Return Rich-formatted detail + recon analysis text for a PacketRecord."""
+def _format_packet_detail(pkt: PacketRecord,
+                          hardware_info: Optional[dict] = None) -> str:
+    """Return Rich-formatted detail + recon analysis text for a PacketRecord.
+
+    hardware_info is an optional dict describing the receiver — when supplied,
+    a RECEIVER / HARDWARE section is appended. Expected keys (all optional):
+      version    firmware version string from AT+VER
+      dev_eui    receiver DevEUI (when available; LoRaWAN mode only)
+      module     hardware identifier (e.g. "M5Stack Unit LoRaWAN-EU868 / RAK3172")
+      port       serial port (/dev/ttyUSB0)
+      baudrate   UART baud
+      region     band plan (always EU868 in this tool)
+    """
     lines: list[str] = []
     lw = parse_lorawan(pkt.raw_hex) if pkt.raw_hex else {}
 
@@ -221,13 +236,53 @@ def _format_packet_detail(pkt: PacketRecord) -> str:
 
     elif pkt.join_eui or pkt.dev_eui:
         if pkt.join_eui:
+            jvendor = pkt.join_eui_vendor or lookup_vendor(pkt.join_eui) or "—"
             row("JoinEUI / AppEUI", pkt.join_eui,
                 "identifies the application / network server")
+            row("JoinEUI vendor", jvendor,
+                "OUI lookup of the JoinEUI prefix")
         if pkt.dev_eui:
+            dvendor = pkt.dev_eui_vendor or lookup_vendor(pkt.dev_eui) or "—"
             row("DevEUI", pkt.dev_eui,
                 "globally unique device ID (like a MAC address)")
             row("DevEUI OUI", pkt.dev_eui[:6],
-                "first 3 bytes — IEEE-registered manufacturer/vendor (lookup at ieee.org)")
+                "first 3 bytes — IEEE OUI")
+            row("DevEUI vendor", dvendor,
+                "OUI lookup (curated table; longest prefix match)")
+        if pkt.dev_nonce is not None:
+            row("DevNonce", f"0x{pkt.dev_nonce:04X}",
+                "16-bit join nonce; repeats from one DevEUI are a replay smell")
+
+    if pkt.is_multicast:
+        row("Multicast", "yes  (DevAddr ≥ 0xFF000000)",
+            "conventional FUOTA / Class C multicast range")
+
+    if pkt.replay_alert:
+        section("SECURITY ALERT")
+        lines.append(f"  [bold bright_red]▸[/bold bright_red]  {pkt.replay_alert}")
+
+    if pkt.is_beacon and pkt.beacon:
+        section("CLASS B BEACON")
+        row("UTC time", str(pkt.beacon.get("utc", "?")))
+        row("GPS seconds", str(pkt.beacon.get("gps_seconds", "?")))
+        row("GwSpecific", str(pkt.beacon.get("gw_info", "?")))
+        row("CRC1 / CRC2", f"0x{pkt.beacon.get('crc1', 0):04X} / 0x{pkt.beacon.get('crc2', 0):04X}")
+
+    if pkt.is_meshtastic and pkt.meshtastic:
+        section("MESHTASTIC HEADER")
+        m = pkt.meshtastic
+        row("Source",      m.get("src", "?"))
+        row("Destination", m.get("dst", "?"))
+        row("Packet ID",   f"0x{m.get('packet_id', 0):08X}")
+        row("Hop limit",   str(m.get("hop_limit", "?")))
+        row("Want ACK",    "yes" if m.get("want_ack") else "no")
+        row("Via MQTT",    "yes" if m.get("via_mqtt") else "no")
+        row("Channel hash", f"0x{m.get('channel_hash', 0):02X}")
+
+    if pkt.lpp_sensors:
+        section("CAYENNE LPP DECODE (plaintext)")
+        for s in pkt.lpp_sensors:
+            lines.append(f"  [bright_green]▸[/bright_green]  {s}")
 
     if pkt.mac_commands:
         section("MAC COMMANDS (FOpts)")
@@ -237,6 +292,25 @@ def _format_packet_detail(pkt: PacketRecord) -> str:
     # ── Recon Analysis ───────────────────────────────────────────────────────
     section("RECONNAISSANCE ANALYSIS")
     _add_recon_notes(pkt, lw, lines)
+
+    # ── Receiver / Hardware (the M5Stack/RAK3172 doing the listening) ────────
+    if hardware_info:
+        section("RECEIVER / HARDWARE")
+        if hardware_info.get("module"):
+            row("Module",       hardware_info["module"])
+        if hardware_info.get("version"):
+            row("Firmware",     hardware_info["version"])
+        if hardware_info.get("dev_eui") and hardware_info["dev_eui"] not in ("–", "unknown"):
+            dvendor = lookup_vendor(hardware_info["dev_eui"]) or "—"
+            row("Receiver DevEUI", hardware_info["dev_eui"],
+                f"vendor: {dvendor}")
+        if hardware_info.get("port"):
+            br = hardware_info.get("baudrate")
+            port_val = f"{hardware_info['port']}" + (f"  @ {br} baud" if br else "")
+            row("Serial port",  port_val)
+        if hardware_info.get("region"):
+            row("Region",       hardware_info["region"],
+                "channel plan + sensitivity floors per region")
 
     return "\n".join(lines)
 
@@ -248,6 +322,26 @@ def _add_recon_notes(pkt: PacketRecord, lw: dict, lines: list[str]) -> None:
         lines.append(f"  [bold {col}]▸[/bold {col}]  {text}")
 
     mtype = pkt.mtype or ""
+
+    if pkt.is_meshtastic:
+        note("Meshtastic frame (sync word 0x2B) — public mesh, not LoRaWAN.", "bright_green")
+        if pkt.meshtastic:
+            note(f"Source 0x{pkt.meshtastic.get('src','?')} → "
+                 f"destination 0x{pkt.meshtastic.get('dst','?')} "
+                 f"(hop limit {pkt.meshtastic.get('hop_limit','?')}).", "white")
+            if pkt.meshtastic.get("via_mqtt"):
+                note("Flagged via_mqtt → message was bridged from MQTT, not pure RF.", "yellow")
+        note("Payload after the 16-byte header is AES-256 encrypted under the channel PSK.",
+             "dim")
+        return
+
+    if pkt.is_beacon:
+        note("Class B beacon — gateway is time-synchronised (probably GPS-disciplined).",
+             "bright_magenta")
+        note("Beacons broadcast every 128 s on 869.525 MHz / SF9 BW125 in EU868.", "white")
+        if pkt.beacon and pkt.beacon.get("utc"):
+            note(f"Beacon UTC timestamp: {pkt.beacon['utc']}.", "white")
+        return
 
     if pkt.is_downlink:
         note("Active gateway confirmed — this downlink was heard on RX2 (869.525 MHz / SF12).",
@@ -263,12 +357,18 @@ def _add_recon_notes(pkt: PacketRecord, lw: dict, lines: list[str]) -> None:
         note("OTAA join attempt — device is requesting to join a LoRaWAN network.", "yellow")
         note("Join Request frames are NOT encrypted — DevEUI and JoinEUI are plaintext.",
              "bright_red")
-        note("DevEUI is globally unique; the OUI (first 3 bytes) can identify the manufacturer.",
-             "white")
+        if pkt.dev_eui_vendor:
+            note(f"DevEUI vendor: {pkt.dev_eui_vendor}.", "white")
+        elif pkt.dev_eui:
+            note("DevEUI vendor not in local OUI table — looks up at ieee.org/oui.", "white")
+        if pkt.join_eui_vendor:
+            note(f"JoinEUI vendor: {pkt.join_eui_vendor}.", "white")
         note("EU868 OTAA: device will try all 8 channels in sequence — watch other channels.",
              "white")
         note("If a Join Accept appears on RX2 (869.525 MHz / SF12) shortly after, join succeeded.",
              "white")
+        if pkt.replay_alert:
+            note(pkt.replay_alert, "bright_red")
         return
 
     if "Join Accept" in mtype:
@@ -280,8 +380,22 @@ def _add_recon_notes(pkt: PacketRecord, lw: dict, lines: list[str]) -> None:
     if "Up" in mtype:
         note("Regular uplink: device is sending sensor/application data to the network.",
              "bright_green")
-        note("Payload is AES-128 encrypted — content is not recoverable without the AppSKey.",
-             "dim")
+        if pkt.lpp_sensors:
+            note("FRMPayload decoded as Cayenne LPP — this network isn't encrypting payloads.",
+                 "bright_red")
+            for s in pkt.lpp_sensors[:3]:
+                note(f"LPP: {s}", "white")
+        else:
+            note("Payload is AES-128 encrypted — content is not recoverable without the AppSKey.",
+                 "dim")
+        if pkt.is_multicast:
+            note("DevAddr is in the conventional multicast range (≥0xFF000000) — "
+                 "this may be a FUOTA / Class C multicast frame.", "yellow")
+        if pkt.is_retransmit:
+            note("Retransmission: same (DevAddr, FCnt) seen within the retransmit window — "
+                 "device didn't receive an ACK or link is at the edge.", "yellow")
+        if pkt.replay_alert:
+            note(pkt.replay_alert, "bright_red")
         if pkt.fcnt is not None:
             if pkt.fcnt < 10:
                 note(f"Low FCnt ({pkt.fcnt}): device recently joined (OTAA) or reset / "
@@ -334,24 +448,54 @@ def _add_recon_notes(pkt: PacketRecord, lw: dict, lines: list[str]) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _make_pkt(evt: dict, freq: int, sf: int, is_downlink: bool = False) -> PacketRecord:
+def _make_pkt(evt: dict, freq: int, sf: int, is_downlink: bool = False,
+              bw: int = 125, is_beacon: bool = False,
+              is_meshtastic: bool = False) -> PacketRecord:
     raw_hex = evt.get("raw_hex", "")
+    if is_meshtastic:
+        return PacketRecord(
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            freq=freq, sf=sf, bw=bw,
+            rssi=evt.get("rssi"), snr=evt.get("snr"),
+            raw_hex=raw_hex,
+            mtype="Meshtastic",
+            is_downlink=is_downlink,
+            is_meshtastic=True,
+            meshtastic=(parse_meshtastic(raw_hex) or None) if raw_hex else None,
+        )
+    if is_beacon:
+        return PacketRecord(
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            freq=freq, sf=sf, bw=bw,
+            rssi=evt.get("rssi"), snr=evt.get("snr"),
+            raw_hex=raw_hex,
+            mtype="Class B Beacon",
+            is_downlink=True,
+            is_beacon=True,
+            beacon=(parse_beacon(raw_hex) or None) if raw_hex else None,
+        )
     lw = parse_lorawan(raw_hex) if raw_hex else {}
     return PacketRecord(
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        freq=freq, sf=sf, bw=125,
+        freq=freq, sf=sf, bw=bw,
         rssi=evt.get("rssi"),
         snr=evt.get("snr"),
         raw_hex=raw_hex,
         mtype=lw.get("mtype"),
         dev_addr=lw.get("dev_addr"),
         nwk_id=lw.get("nwk_id"),
+        netid_type=lw.get("netid_type"),
         operator=lw.get("operator_hint"),
         fcnt=lw.get("fcnt"),
         join_eui=lw.get("join_eui"),
         dev_eui=lw.get("dev_eui"),
+        dev_nonce=lw.get("dev_nonce"),
+        join_eui_vendor=lw.get("join_eui_vendor"),
+        dev_eui_vendor=lw.get("dev_eui_vendor"),
         is_downlink=is_downlink,
+        is_multicast=lw.get("is_multicast", False),
         mac_commands=lw.get("mac_commands"),
+        lpp_sensors=lw.get("lpp_sensors"),
     )
 
 
@@ -368,8 +512,13 @@ class HardwareScanner:
     def __init__(self, unit: LoRaUnit):
         self.unit = unit
         self.rx2_interval = 10         # check RX2 downlink channel every N lock cycles
+        self.beacon_interval = 0       # 0 disables; N>0 = check every N cycles
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.retransmit_tracker = RetransmissionTracker()
+        self.replay_tracker: Optional[ReplayTracker] = None
+        self.meshtastic_mode = False
+        self.meshtastic_preset = "LongFast"
 
     def stop(self, timeout: float = 5.0):
         """Signal stop; cancel active RX window so thread exits within 0.2 s."""
@@ -406,6 +555,24 @@ class HardwareScanner:
         )
         self._thread.start()
 
+    def start_meshtastic(self, preset: str, on_packet: Callable,
+                         on_channel: Optional[Callable] = None):
+        """Listen for Meshtastic traffic on a single EU preset.
+
+        Sets sync word to 0x2B for the duration; restores LORAWAN_SYNCWORD
+        when the loop exits so subsequent LoRaWAN sweeps keep working.
+        """
+        if preset not in MESHTASTIC_EU_PRESETS:
+            raise ValueError(f"unknown Meshtastic preset {preset!r}")
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._meshtastic_loop,
+            args=(preset, on_packet, on_channel),
+            daemon=True,
+            name="lora-meshtastic",
+        )
+        self._thread.start()
+
     # ---- internals ---------------------------------------------------------
 
     def _sweep_loop(self, on_channel: Callable, on_packet: Callable):
@@ -421,6 +588,12 @@ class HardwareScanner:
                 if hop % self.rx2_interval == 0 and not self._stop.is_set():
                     on_channel(RX2_FREQ, RX2_SF)
                     self._do_rx(RX2_FREQ, RX2_SF, on_packet, dedup, is_downlink=True)
+                if (self.beacon_interval > 0
+                        and hop % self.beacon_interval == 0
+                        and not self._stop.is_set()):
+                    on_channel(BEACON_FREQ_EU868, BEACON_SF)
+                    self._do_rx(BEACON_FREQ_EU868, BEACON_SF, on_packet, dedup,
+                                is_downlink=True, bw=BEACON_BW, is_beacon=True)
             dedup.purge()
 
     def _lock_loop(self, freq: Optional[int], sf: int, on_packet: Callable,
@@ -443,12 +616,33 @@ class HardwareScanner:
                     on_channel(RX2_FREQ, RX2_SF)
                 self._do_rx(RX2_FREQ, RX2_SF, on_packet, dedup, is_downlink=True)
 
+    def _meshtastic_loop(self, preset: str, on_packet: Callable,
+                          on_channel: Optional[Callable]):
+        freq, sf, bw = MESHTASTIC_EU_PRESETS[preset]
+        if not self.unit.set_syncword(MESHTASTIC_SYNCWORD):
+            # Continue anyway — degraded but still useful for debugging
+            pass
+        try:
+            dedup = DeduplicationCache()
+            while not self._stop.is_set():
+                if on_channel:
+                    on_channel(freq, sf)
+                self._do_rx(freq, sf, on_packet, dedup,
+                            bw=bw, is_meshtastic=True)
+        finally:
+            try:
+                self.unit.set_syncword(LORAWAN_SYNCWORD)
+            except Exception:
+                pass
+
     def _do_rx(self, freq: int, sf: int, on_packet: Callable,
-               dedup: DeduplicationCache, is_downlink: bool = False):
+               dedup: DeduplicationCache, is_downlink: bool = False,
+               bw: int = 125, is_beacon: bool = False,
+               is_meshtastic: bool = False):
         if self._stop.is_set():
             return
-        dwell = SF_DWELL[sf]
-        if not self.unit.configure_p2p(freq, sf):
+        dwell = SF_DWELL.get(sf, 5)
+        if not self.unit.configure_p2p(freq, sf, bw=bw):
             return
         self.unit.set_iq_inversion(is_downlink)  # downlinks need inverted IQ
         self.unit.start_rx()                      # continuous (65534); stop_rx() ends the window
@@ -471,9 +665,29 @@ class HardwareScanner:
         for evt in parse_events(lines):
             if self._stop.is_set():
                 return
-            pkt = _make_pkt(evt, freq, sf, is_downlink)
+            pkt = _make_pkt(evt, freq, sf, is_downlink, bw=bw,
+                            is_beacon=is_beacon, is_meshtastic=is_meshtastic)
+            self._annotate_trackers(pkt)
+            # Dedup still suppresses repeats from the table; retransmit counts
+            # accumulate in self.retransmit_tracker for the stats panel to read.
             if not dedup.is_duplicate(pkt.dev_addr, pkt.fcnt):
                 on_packet(pkt)
+
+    def _annotate_trackers(self, pkt: PacketRecord) -> None:
+        if pkt.dev_addr and pkt.fcnt is not None:
+            retry = self.retransmit_tracker.observe(pkt.dev_addr, pkt.fcnt)
+            if retry > 0:
+                pkt.is_retransmit = True
+        if not self.replay_tracker:
+            return
+        if pkt.dev_eui and pkt.dev_nonce is not None:
+            alert = self.replay_tracker.check_join(pkt.dev_eui, pkt.dev_nonce)
+            if alert:
+                pkt.replay_alert = alert
+        if pkt.dev_addr and pkt.fcnt is not None:
+            alert = self.replay_tracker.check_fcnt(pkt.dev_addr, pkt.fcnt)
+            if alert:
+                pkt.replay_alert = alert
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +710,7 @@ class SweepScreen(Screen):
     BINDINGS = [
         Binding("r", "reset",            "Reset stats",    show=True),
         Binding("l", "lock_single",      "Lock freq+SF",   show=True),
+        Binding("m", "meshtastic",       "Meshtastic",     show=True),
         Binding("i", "cycle_rx2",        "RX2 interval",   show=True),
         Binding("c", "copy",             "Copy row",       show=True),
         Binding("q", "app.quit",         "Quit",           show=True),
@@ -640,6 +855,12 @@ class SweepScreen(Screen):
         nxt = presets[(presets.index(cur) + 1) % len(presets)] if cur in presets else presets[0]
         self._scanner.rx2_interval = nxt
         self.notify(f"RX2 check every {nxt} hops", timeout=2)
+
+    def action_meshtastic(self) -> None:
+        """M: stop LoRaWAN sweep, push the Meshtastic screen at the configured preset."""
+        self._scanner.stop()
+        preset = self._scanner.meshtastic_preset or "LongFast"
+        self.app.push_screen(MeshtasticScreen(self._scanner, preset=preset))
 
     def action_copy(self) -> None:
         t = self.query_one("#sw_table", DataTable)
@@ -822,6 +1043,14 @@ class LockScreen(Screen):
 
     def _update_stats(self, stats: Static) -> None:
         gw = "  *** GATEWAY NEARBY! ***" if self._downlinks else ""
+        # Sum retransmits per DevAddr from the scanner's tracker
+        retrans_by_addr: dict[str, int] = defaultdict(int)
+        try:
+            for (addr, _fcnt), count in self._scanner.retransmit_tracker._count.items():
+                if count:
+                    retrans_by_addr[addr] += count
+        except AttributeError:
+            pass
         lines = [
             f"Pkts: {len(self._pkts)}   "
             f"Unique DevAddrs: {len(self._addrs)}   "
@@ -840,6 +1069,8 @@ class LockScreen(Screen):
                 dt = t1 - t0
                 rate = (f1 - f0) / dt * 60 if dt > 0 else 0
                 parts.append(f"FCnt {f0}→{f1}  (~{rate:.1f} frames/min)")
+            if retrans_by_addr.get(addr):
+                parts.append(f"retransmits={retrans_by_addr[addr]}")
             lines.append("   ".join(parts))
         stats.update("\n".join(lines))
 
@@ -871,6 +1102,140 @@ class LockScreen(Screen):
     def action_back(self) -> None:
         self._scanner.stop()
         self.app.pop_screen()  # on_show on SweepScreen restarts sweep
+
+
+# ---------------------------------------------------------------------------
+# Meshtastic Screen — single-channel capture at the chosen EU preset.
+# Switches sync word to 0x2B; restored on exit by HardwareScanner.
+# ---------------------------------------------------------------------------
+class MeshtasticScreen(Screen):
+
+    CSS = """
+    MeshtasticScreen { layout: vertical; }
+    #mt_header {
+        height: 1;
+        background: $success-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
+    #mt_status {
+        height: 1;
+        background: $primary-darken-2;
+        padding: 0 1;
+        color: $text;
+    }
+    #mt_table { height: 2fr; }
+    #mt_stats {
+        height: 1fr;
+        background: $surface;
+        border-top: solid $primary;
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "back",     "Back to sweep", show=True),
+        Binding("c",      "copy",     "Copy packet",   show=True),
+        Binding("q",      "app.quit", "Quit",          show=True),
+    ]
+
+    def __init__(self, scanner: HardwareScanner, preset: str = "LongFast"):
+        super().__init__()
+        self._scanner = scanner
+        self._preset  = preset
+        self._freq, self._sf, self._bw = MESHTASTIC_EU_PRESETS[preset]
+        self._pkts: list[PacketRecord] = []
+        self._seen_nodes: set[str] = set()       # avoid clashing with Screen._nodes
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        hdr = (f"MESHTASTIC  {self._preset}  {self._freq/1e6:.3f} MHz  "
+               f"SF{self._sf}  BW{self._bw}  sync=0x2B   [Esc] back to sweep")
+        yield Static(hdr, id="mt_header")
+        yield Static("", id="mt_status")
+        yield DataTable(id="mt_table", cursor_type="row", zebra_stripes=True)
+        yield Static("Waiting for Meshtastic packets…", id="mt_stats")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        t = self.query_one("#mt_table", DataTable)
+        t.add_column("Time UTC", width=10)
+        t.add_column("RSSI",     width=7)
+        t.add_column("SNR",      width=6)
+        t.add_column("Margin",   width=8)
+        t.add_column("Src",      width=10)
+        t.add_column("Dst",      width=10)
+        t.add_column("PktID",    width=12)
+        t.add_column("Hop",      width=4)
+        t.add_column("Flags",    width=14)
+        t.add_column("ChHash",   width=8)
+        self._scanner.start_meshtastic(
+            preset=self._preset,
+            on_packet=lambda p: self._post_to_ui(self._on_packet, p),
+            on_channel=lambda f, s: self._post_to_ui(self._on_channel, f, s),
+        )
+
+    def _post_to_ui(self, fn, *args) -> None:
+        try:
+            self.app.call_from_thread(fn, *args)
+        except Exception:
+            pass
+
+    def _on_channel(self, freq: int, sf: int) -> None:
+        try:
+            status = self.query_one("#mt_status", Static)
+        except Exception:
+            return
+        dwell = SF_DWELL.get(sf, 5)
+        status.update(f"Listening  {freq/1e6:.3f} MHz  SF{sf}  BW{self._bw}  dwell={dwell}s")
+
+    def _on_packet(self, pkt: PacketRecord) -> None:
+        try:
+            t = self.query_one("#mt_table", DataTable)
+            stats = self.query_one("#mt_stats", Static)
+        except Exception:
+            return
+        self._pkts.append(pkt)
+        m = pkt.meshtastic or {}
+        if m.get("src"):
+            self._seen_nodes.add(m["src"])
+        margin = _link_margin(pkt.rssi, pkt.sf)
+        flags = []
+        if m.get("want_ack"): flags.append("ACK?")
+        if m.get("via_mqtt"): flags.append("MQTT")
+        t.add_row(
+            pkt.timestamp[11:19],
+            str(pkt.rssi) if pkt.rssi is not None else "?",
+            str(pkt.snr)  if pkt.snr  is not None else "?",
+            f"{margin:+d} dB" if margin is not None else "?",
+            m.get("src", "?"),
+            m.get("dst", "?"),
+            f"0x{m.get('packet_id', 0):08X}" if m.get("packet_id") is not None else "?",
+            str(m.get("hop_limit", "?")),
+            ",".join(flags),
+            f"0x{m.get('channel_hash', 0):02X}" if m.get("channel_hash") is not None else "?",
+        )
+        t.scroll_end(animate=False)
+        stats.update(f"Pkts: {len(self._pkts)}   Unique nodes: {len(self._seen_nodes)}")
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        idx = event.cursor_row
+        if 0 <= idx < len(self._pkts):
+            self.app.push_screen(PacketDetailScreen(self._pkts, idx))
+
+    def action_copy(self) -> None:
+        t = self.query_one("#mt_table", DataTable)
+        idx = t.cursor_row
+        if 0 <= idx < len(self._pkts):
+            err = _copy_to_clipboard(_strip_markup(_format_packet_detail(self._pkts[idx])))
+            if err:
+                self.notify(f"Clipboard failed — {err}", severity="error", timeout=5)
+            else:
+                self.notify("Packet detail copied to clipboard", timeout=2)
+
+    def action_back(self) -> None:
+        self._scanner.stop()
+        self.app.pop_screen()    # on_show on SweepScreen restarts the sweep
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +1287,10 @@ class PacketDetailScreen(Screen):
     def on_mount(self) -> None:
         self._refresh_detail()
 
+    def _hw(self) -> Optional[dict]:
+        """Pull the receiver hardware info from the App (set in main())."""
+        return getattr(self.app, "_hardware_info", None)
+
     def _refresh_detail(self) -> None:
         if not self._pkts:
             return
@@ -932,7 +1301,8 @@ class PacketDetailScreen(Screen):
                 f"  —  {pkt.timestamp}"
                 f"  |  ← → navigate  |  [Esc] back to lock"
             )
-            self.query_one("#pd_body", Static).update(_format_packet_detail(pkt))
+            self.query_one("#pd_body", Static).update(
+                _format_packet_detail(pkt, hardware_info=self._hw()))
             self.query_one("#pd_scroll", VerticalScroll).scroll_home(animate=False)
         except Exception:
             pass
@@ -940,7 +1310,8 @@ class PacketDetailScreen(Screen):
     def action_copy(self) -> None:
         if not self._pkts:
             return
-        err = _copy_to_clipboard(_strip_markup(_format_packet_detail(self._pkts[self._idx])))
+        text = _format_packet_detail(self._pkts[self._idx], hardware_info=self._hw())
+        err = _copy_to_clipboard(_strip_markup(text))
         if err:
             self.notify(f"Clipboard failed — {err}", severity="error", timeout=5)
         else:
@@ -970,14 +1341,23 @@ class LoRaTUIApp(App):
     Footer { height: 1; }
     """
 
-    def __init__(self, unit: LoRaUnit, device_info: str):
+    def __init__(self, unit: LoRaUnit, device_info: str,
+                 start_meshtastic: bool = False,
+                 hardware_info: Optional[dict] = None):
         super().__init__()
         self._unit = unit
         self._scanner = HardwareScanner(unit)
         self._device_info = device_info
+        self._hardware_info = hardware_info or {}
+        self._start_meshtastic = start_meshtastic
 
     def on_mount(self) -> None:
         self.push_screen(SweepScreen(self._scanner, self._device_info))
+        if self._start_meshtastic:
+            # Push Meshtastic on top — Esc returns to the Sweep screen below
+            self.push_screen(MeshtasticScreen(
+                self._scanner,
+                preset=self._scanner.meshtastic_preset or "LongFast"))
 
     def on_unmount(self) -> None:
         self._scanner.stop()
@@ -998,6 +1378,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--port",     default=None, help="Serial port (auto-detected)")
     p.add_argument("--baudrate", type=int, default=115200)
+    p.add_argument("--beacon-interval", type=int, default=0,
+                   help="Class B beacon check every N sweep/lock cycles (0=disabled)")
+    p.add_argument("--replay-state", default=None,
+                   help="JSON sidecar to persist DevNonce/FCnt history for replay alerts")
+    p.add_argument("--meshtastic", action="store_true",
+                   help="Boot straight into the Meshtastic screen (sync word 0x2B)")
+    p.add_argument("--meshtastic-preset", default="LongFast",
+                   choices=list(MESHTASTIC_EU_PRESETS.keys()),
+                   help="Meshtastic EU preset to capture on")
     return p
 
 
@@ -1026,12 +1415,32 @@ def main():
     dev_eui  = unit.get_deveui() if nwm == 1 else "–"
     device_info = f"{version}  DevEUI={dev_eui}"
 
+    hardware_info = {
+        "module":   "M5Stack Unit LoRaWAN-EU868 (RAK3172 / STM32WLE5)",
+        "version":  version,
+        "dev_eui":  dev_eui,
+        "port":     port,
+        "baudrate": args.baudrate,
+        "region":   "EU868",
+    }
+
     if not unit.set_p2p_mode():
         print("ERROR: Could not switch to P2P mode.", file=sys.stderr)
         unit.close()
         sys.exit(1)
 
-    LoRaTUIApp(unit, device_info).run()
+    app = LoRaTUIApp(unit, device_info,
+                     start_meshtastic=args.meshtastic,
+                     hardware_info=hardware_info)
+    app._scanner.beacon_interval = args.beacon_interval
+    app._scanner.meshtastic_preset = args.meshtastic_preset
+    if args.replay_state:
+        app._scanner.replay_tracker = ReplayTracker(args.replay_state)
+    try:
+        app.run()
+    finally:
+        if app._scanner.replay_tracker:
+            app._scanner.replay_tracker.save()
 
 
 if __name__ == "__main__":

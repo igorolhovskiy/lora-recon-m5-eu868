@@ -61,6 +61,28 @@ SPREADING_FACTORS = [7, 8, 9, 10, 11, 12]
 # Recommended dwell time per SF (seconds) — enough to catch one packet airtime
 SF_DWELL = {7: 2, 8: 3, 9: 5, 10: 8, 11: 12, 12: 20}
 
+# Class B beacon (EU868): broadcast every 128 s on RX2 frequency at SF9 BW125.
+# Beacon PHYPayload is 17 bytes: 2 RFU + 4 Time + 2 CRC1 + 7 GwSpecific + 2 CRC2.
+BEACON_FREQ_EU868 = 869525000
+BEACON_SF         = 9
+BEACON_BW         = 125
+BEACON_PERIOD_S   = 128
+
+# LoRa sync words. LoRaWAN public networks use 0x34 (sent as 0x3444 in the
+# RAK3172 register field). Meshtastic uses 0x2B (sent as 0x2B44). Private LoRa
+# P2P defaults to 0x12.
+LORAWAN_SYNCWORD    = "3444"
+MESHTASTIC_SYNCWORD = "2B44"
+
+# Meshtastic EU presets. PSK is independent of these RF parameters.
+MESHTASTIC_EU_PRESETS = {
+    "LongFast":  (869525000, 11, 250),   # default in EU community channels
+    "LongSlow":  (869525000, 12, 125),
+    "VLongSlow": (869525000, 12, 125),   # different coding rate; same RF tuning
+    "MediumFast": (869525000, 9, 250),
+    "ShortFast": (869525000, 7, 250),
+}
+
 # LoRaWAN MHDR message types (top 3 bits of first byte)
 MTYPE = {
     0b000: "Join Request",
@@ -72,6 +94,131 @@ MTYPE = {
     0b110: "RFU",
     0b111: "Proprietary",
 }
+
+# ---------------------------------------------------------------------------
+# NetID layout (LoRaWAN Backend Spec 1.0, §6.1.4).
+# DevAddr layout per Type, most-significant bits first:
+#   Type 0:  0         | NwkID(6)  | NwkAddr(25)
+#   Type 1:  10        | NwkID(6)  | NwkAddr(24)
+#   Type 2:  110       | NwkID(9)  | NwkAddr(20)
+#   Type 3:  1110      | NwkID(11) | NwkAddr(17)
+#   Type 4:  11110     | NwkID(12) | NwkAddr(15)
+#   Type 5:  111110    | NwkID(13) | NwkAddr(13)
+#   Type 6:  1111110   | NwkID(15) | NwkAddr(10)
+#   Type 7:  11111110  | NwkID(17) | NwkAddr(7)
+# ---------------------------------------------------------------------------
+_NETID_LAYOUT: dict[int, tuple[int, int]] = {
+    0: (6, 25), 1: (6, 24), 2: (9, 20), 3: (11, 17),
+    4: (12, 15), 5: (13, 13), 6: (15, 10), 7: (17, 7),
+}
+
+# Curated operator names from publicly documented LoRa Alliance NetID
+# assignments. Keyed by (NetID type, NwkID). Add more locally as needed —
+# the spec allocates up to 17 bits of NwkID so this list will never be
+# exhaustive.
+NETID_OPERATORS: dict[tuple[int, int], str] = {
+    (0, 0x00): "Private / ChirpStack",
+    (0, 0x01): "Experimental",
+    (0, 0x13): "TTN (The Things Network)",
+    (0, 0x24): "Actility / ThingPark",
+    (6, 0x0053): "Helium",
+}
+
+# Curated OUI database for DevEUI / JoinEUI manufacturer lookup. Supports
+# both 24-bit (IEEE OUI) and 36-bit (IEEE MA-S sub-allocation) prefixes;
+# longest match wins. All keys are uppercase hex with no separators.
+#
+# The 70:B3:D5 prefix is IEEE Registration Authority's MA-S block used by
+# many small LoRa makers via sub-allocations — see the 9-char entries below.
+OUI_VENDORS: dict[str, str] = {
+    # 24-bit IEEE OUIs (LoRa-relevant)
+    "0004A3": "Microchip",
+    "000800": "Multi-Tech Systems",
+    "0018B2": "Adeunis",
+    "001DC9": "Murata",
+    "00250C": "Semtech",
+    "0080E1": "STMicroelectronics",
+    "247EBD": "Semtech",
+    "24E124": "Milesight IoT",
+    "58A0CB": "Browan / Compal",
+    "7CC525": "Kerlink",
+    "A84041": "Dragino",
+    "AC1F09": "RAK Wireless",
+    # 24-bit IEEE-RA MA-S parent block — note its presence, then fall back to
+    # 9-char keys below for finer attribution.
+    "70B3D5": "IEEE-RA MA-S (multi-vendor; see 36-bit sub-allocations)",
+    # 36-bit IEEE MA-S sub-allocations under 70:B3:D5 (LoRa-relevant)
+    "70B3D526": "Adeunis (newer batches)",
+    "70B3D538": "Tabs / Browan trackers",
+    "70B3D549": "Globalsat",
+    "70B3D557": "Sensative",
+    "70B3D567": "Tektelic",
+    "70B3D580": "Abeeway",
+    "70B3D582": "Strega",
+    "70B3D588": "Microchip (LoRa modules)",
+    "70B3D59B": "Lansitec",
+    "70B3D5B0": "Bosch Connected Devices",
+    "70B3D5CF": "Dragino (newer)",
+    "70B3D5E1": "Sagemcom Energy & Telecom",
+}
+
+# ---------------------------------------------------------------------------
+# NetID / DevAddr / vendor helpers
+# ---------------------------------------------------------------------------
+def parse_netid(dev_addr: int) -> tuple[int, int]:
+    """
+    Decode (NetID type, NwkID) from a 32-bit DevAddr per LoRaWAN spec.
+
+    Type is determined by the count of leading 1-bits (0..7); the bit after
+    the run of 1s is always 0. NwkID and NwkAddr widths come from _NETID_LAYOUT.
+    """
+    da = dev_addr & 0xFFFFFFFF
+    netid_type = 0
+    for bit in range(31, 23, -1):           # Type 7 has 7 leading 1s, then a 0
+        if (da >> bit) & 1:
+            netid_type += 1
+        else:
+            break
+    if netid_type > 7:                      # spec defines Type 0..7 only
+        netid_type = 7
+    nwk_bits, addr_bits = _NETID_LAYOUT[netid_type]
+    nwk_id = (da >> addr_bits) & ((1 << nwk_bits) - 1)
+    return netid_type, nwk_id
+
+
+def lookup_operator(netid_type: int, nwk_id: int) -> Optional[str]:
+    """Return the operator name for a given (NetID type, NwkID), or None."""
+    return NETID_OPERATORS.get((netid_type, nwk_id))
+
+
+def lookup_vendor(eui: str) -> Optional[str]:
+    """
+    Best-effort manufacturer lookup for a DevEUI / JoinEUI / MAC.
+
+    Tries progressively shorter prefixes so a 36-bit MA-S sub-allocation wins
+    over its parent 24-bit MA-L block. Recognises 24-bit (IEEE OUI), 28-bit
+    (IEEE MA-M), 32-bit (common community-DB shorthand within 70:B3:D5), and
+    36-bit (IEEE MA-S) prefixes.
+    """
+    if not eui:
+        return None
+    e = eui.strip().upper().replace(":", "").replace("-", "")
+    for length in (9, 8, 7, 6):
+        if len(e) >= length and e[:length] in OUI_VENDORS:
+            return OUI_VENDORS[e[:length]]
+    return None
+
+
+def is_multicast_devaddr(dev_addr: int) -> bool:
+    """
+    LoRaWAN does not strictly bind multicast DevAddrs to a specific range —
+    networks assign them via Remote Multicast Setup (TS005). By convention,
+    the upper end of the address space (0xFF000000..0xFFFFFFFF) is reserved
+    for multicast groups (Class C broadcasts, FUOTA), with 0xFFFFFFFF as
+    the broadcast address. This is a heuristic, not a definitive marker.
+    """
+    return (dev_addr & 0xFFFFFFFF) >= 0xFF000000
+
 
 # ---------------------------------------------------------------------------
 # MAC command (FOpts) parser — LoRaWAN 1.0.x (unencrypted in-band commands)
@@ -211,6 +358,153 @@ def parse_fopts(fopts: bytes, is_uplink: bool) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Cayenne Low Power Payload (LPP) decoder.
+# Format: each measurement is [Channel(1), Type(1), Data(N)]. Useful only on
+# private/ChirpStack networks where AppSKey isn't used; on commercial networks
+# FRMPayload is AES-128 encrypted and the LPP bytes will look random.
+# Spec: https://docs.mydevices.com/docs/lorawan/cayenne-lpp
+# ---------------------------------------------------------------------------
+_LPP_TYPES: dict[int, tuple[int, str]] = {
+    # type → (data_bytes, decoder_label)
+    0x00: (1,  "digital_in"),
+    0x01: (1,  "digital_out"),
+    0x02: (2,  "analog_in"),
+    0x03: (2,  "analog_out"),
+    0x65: (2,  "illuminance"),
+    0x66: (1,  "presence"),
+    0x67: (2,  "temperature"),
+    0x68: (1,  "humidity"),
+    0x71: (6,  "accelerometer"),
+    0x73: (2,  "barometer"),
+    0x86: (6,  "gyrometer"),
+    0x88: (9,  "gps"),
+}
+
+
+def parse_lpp(payload: bytes) -> list[str]:
+    """
+    Best-effort Cayenne LPP decode. Returns a list of human-readable strings
+    like "ch1 temperature=23.5C" / "ch2 humidity=46.5%". Stops at the first
+    type byte it doesn't recognise to avoid producing fictional readings
+    from random AES-encrypted bytes.
+    """
+    out: list[str] = []
+    i = 0
+    while i + 2 <= len(payload):
+        ch, typ = payload[i], payload[i + 1]
+        i += 2
+        spec = _LPP_TYPES.get(typ)
+        if not spec:
+            break
+        size, label = spec
+        if i + size > len(payload):
+            break
+        data = payload[i:i + size]
+        i += size
+        try:
+            if typ == 0x00 or typ == 0x01:
+                out.append(f"ch{ch} {label}={data[0]}")
+            elif typ == 0x02 or typ == 0x03:                       # signed 0.01 V
+                val = struct.unpack(">h", data)[0] / 100.0
+                out.append(f"ch{ch} {label}={val:.2f}V")
+            elif typ == 0x65:                                      # illuminance, lux
+                val = struct.unpack(">H", data)[0]
+                out.append(f"ch{ch} {label}={val}lux")
+            elif typ == 0x66:
+                out.append(f"ch{ch} {label}={data[0]}")
+            elif typ == 0x67:                                      # signed 0.1 °C
+                val = struct.unpack(">h", data)[0] / 10.0
+                out.append(f"ch{ch} {label}={val:.1f}C")
+            elif typ == 0x68:                                      # unsigned 0.5 %
+                out.append(f"ch{ch} {label}={data[0] / 2.0:.1f}%")
+            elif typ == 0x71:                                      # 3 × signed 0.001 g
+                x, y, z = struct.unpack(">hhh", data)
+                out.append(f"ch{ch} {label}=({x/1000:.3f},{y/1000:.3f},{z/1000:.3f})g")
+            elif typ == 0x73:                                      # unsigned 0.1 hPa
+                val = struct.unpack(">H", data)[0] / 10.0
+                out.append(f"ch{ch} {label}={val:.1f}hPa")
+            elif typ == 0x86:                                      # 3 × signed 0.01 °/s
+                x, y, z = struct.unpack(">hhh", data)
+                out.append(f"ch{ch} {label}=({x/100:.2f},{y/100:.2f},{z/100:.2f})dps")
+            elif typ == 0x88:                                      # GPS, 24-bit signed
+                lat = int.from_bytes(data[0:3], "big", signed=True) / 10000.0
+                lon = int.from_bytes(data[3:6], "big", signed=True) / 10000.0
+                alt = int.from_bytes(data[6:9], "big", signed=True) / 100.0
+                out.append(f"ch{ch} {label}=({lat:.4f},{lon:.4f},{alt:.2f}m)")
+        except (struct.error, ValueError):
+            break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Class B beacon frame parser (EU868: 17-byte payload).
+# Layout per LoRaWAN v1.0.4 §15.2:
+#   RFU(2) | Time(4 LE GPS sec) | CRC1(2) | GwSpecific(7) | CRC2(2)
+# We don't verify CRCs — passive recon just notes structural fit.
+# ---------------------------------------------------------------------------
+def parse_beacon(raw_hex: str) -> dict:
+    """Decode a Class B beacon PHYPayload. Returns {} if length is wrong."""
+    try:
+        data = bytes.fromhex(raw_hex)
+    except ValueError:
+        return {}
+    if len(data) != 17:
+        return {}
+    gps_seconds = struct.unpack_from("<I", data, 2)[0]
+    crc1 = struct.unpack_from("<H", data, 6)[0]
+    gw_info = data[8:15]
+    crc2 = struct.unpack_from("<H", data, 15)[0]
+    info_desc = gw_info[0]
+    try:
+        utc = datetime.fromtimestamp(gps_seconds + 315964800 - 18,
+                                     tz=timezone.utc).isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        utc = f"GPS+{gps_seconds}s"
+    return {
+        "gps_seconds": gps_seconds,
+        "utc":         utc,
+        "crc1":        crc1,
+        "info_desc":   info_desc,
+        "gw_info":     gw_info.hex().upper(),
+        "crc2":        crc2,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Meshtastic packet header parser.
+# Layout (LoRa PHY payload, post-FEC, big-endian fields):
+#   dest(4) | src(4) | packet_id(4) | flags(1) | channel_hash(1) | next_hop(1) | relay_node(1) | ...
+# We decode the first 16 bytes only — anything after is encrypted unless on
+# the public PSK with the right channel name.
+# ---------------------------------------------------------------------------
+def parse_meshtastic(raw_hex: str) -> dict:
+    """Parse the unencrypted Meshtastic packet header. Returns {} on short input."""
+    try:
+        data = bytes.fromhex(raw_hex)
+    except ValueError:
+        return {}
+    if len(data) < 16:
+        return {}
+    dst = struct.unpack_from("<I", data, 0)[0]
+    src = struct.unpack_from("<I", data, 4)[0]
+    pid = struct.unpack_from("<I", data, 8)[0]
+    flags = data[12]
+    hop_limit = flags & 0x07
+    want_ack  = bool(flags & 0x08)
+    via_mqtt  = bool(flags & 0x10)
+    channel_hash = data[13]
+    return {
+        "src":          f"{src:08X}",
+        "dst":          f"{dst:08X}",
+        "packet_id":    pid,
+        "hop_limit":    hop_limit,
+        "want_ack":     want_ack,
+        "via_mqtt":     via_mqtt,
+        "channel_hash": channel_hash,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 @dataclass
@@ -225,15 +519,31 @@ class PacketRecord:
     mtype:      Optional[str]  = None
     dev_addr:   Optional[str]  = None
     nwk_id:     Optional[str]  = None
+    netid_type: Optional[int]  = None          # 0..7 per LoRaWAN spec
     operator:   Optional[str]  = None
     fcnt:       Optional[int]  = None
     join_eui:   Optional[str]  = None
     dev_eui:    Optional[str]  = None
-    is_downlink:  bool               = False   # True if heard on RX2
-    mac_commands: Optional[list[str]] = None
+    dev_nonce:  Optional[int]  = None          # 16-bit from join request
+    join_eui_vendor: Optional[str] = None
+    dev_eui_vendor:  Optional[str] = None
+    is_downlink:    bool = False               # True if heard on RX2
+    is_multicast:   bool = False               # DevAddr in 0xFF000000+ range
+    is_beacon:      bool = False               # Class B beacon
+    is_meshtastic:  bool = False               # detected via sync word
+    is_retransmit:  bool = False               # repeat (DevAddr,FCnt) within window
+    replay_alert:   Optional[str] = None       # DevNonce/FCnt anomaly text
+    mac_commands:   Optional[list[str]] = None
+    lpp_sensors:    Optional[list[str]]  = None   # Cayenne LPP decode (private nets)
+    meshtastic:     Optional[dict]       = None   # Meshtastic header fields
+    beacon:         Optional[dict]       = None   # Class B beacon decode
 
     def summary(self) -> str:
         dl  = " [DOWNLINK→GATEWAY EVIDENCE]" if self.is_downlink else ""
+        bcn = " [BEACON]" if self.is_beacon else ""
+        mc  = " [MULTICAST]" if self.is_multicast else ""
+        rt  = " [RETRANSMIT]" if self.is_retransmit else ""
+        mt  = " [MESHTASTIC]" if self.is_meshtastic else ""
         mac = (f"  MAC=[{', '.join(self.mac_commands)}]"
                if self.mac_commands else "")
         addr_part = f"DevAddr={self.dev_addr}" if self.dev_addr else (
@@ -241,7 +551,8 @@ class PacketRecord:
         return (f"{self.timestamp}  {self.freq/1e6:.3f}MHz SF{self.sf} BW{self.bw} "
                 f"RSSI={self.rssi}dBm SNR={self.snr}dB  "
                 f"mtype={self.mtype or '?'}  {addr_part}  "
-                f"FCnt={self.fcnt if self.fcnt is not None else '?'}{dl}{mac}")
+                f"FCnt={self.fcnt if self.fcnt is not None else '?'}"
+                f"{dl}{bcn}{mc}{rt}{mt}{mac}")
 
 
 # ---------------------------------------------------------------------------
@@ -258,18 +569,29 @@ def parse_lorawan(raw_hex: str) -> dict:
         result["mtype"] = MTYPE.get(mtype_bits, f"Unknown({mtype_bits})")
         # Data frames have DevAddr at bytes 1-4 (little-endian)
         if mtype_bits in (0b010, 0b011, 0b100, 0b101) and len(data) >= 8:
-            dev_addr = struct.unpack_from("<I", data, 1)[0]
-            result["dev_addr"] = f"{dev_addr:08X}"
-            nwk_id = (dev_addr >> 25) & 0x7F
-            result["nwk_id"] = f"0x{nwk_id:02X}"
-            if nwk_id == 0x13:
-                result["operator_hint"] = "TTN (The Things Network)"
-            elif nwk_id == 0x24:
-                result["operator_hint"] = "Actility/ThingPark"
-            elif nwk_id == 0x00:
-                result["operator_hint"] = "Private/ChirpStack"
+            dev_addr_int = struct.unpack_from("<I", data, 1)[0]
+            result["dev_addr"] = f"{dev_addr_int:08X}"
+            netid_type, nwk_id_val = parse_netid(dev_addr_int)
+            result["netid_type"] = netid_type
+            # Keep the legacy 7-bit display form for Type 0 / Type 1 so existing
+            # users (and existing tests) keep working; widen for higher types.
+            if netid_type <= 1:
+                result["nwk_id"] = f"0x{nwk_id_val:02X}"
             else:
-                result["operator_hint"] = f"Unknown (NwkID=0x{nwk_id:02X})"
+                result["nwk_id"] = f"0x{nwk_id_val:0{(_NETID_LAYOUT[netid_type][0] + 3) // 4}X}"
+            op = lookup_operator(netid_type, nwk_id_val)
+            if op:
+                result["operator_hint"] = op
+            else:
+                # Reconstruct the 24-bit NetID for the LoRa Alliance registry
+                # lookup. The registry is at lora-alliance.org/lorawan-for-developers.
+                netid_24 = (netid_type << 21) | nwk_id_val
+                result["operator_hint"] = (
+                    f"Unknown commercial operator "
+                    f"(Type {netid_type}, NwkID={result['nwk_id']}, "
+                    f"NetID=0x{netid_24:06X}) — look up in LoRa Alliance NetID registry"
+                )
+            result["is_multicast"] = is_multicast_devaddr(dev_addr_int)
             fctrl = data[5]
             result["fcnt"] = struct.unpack_from("<H", data, 6)[0]
             result["ack"]  = bool(fctrl & 0x20)
@@ -280,12 +602,29 @@ def parse_lorawan(raw_hex: str) -> dict:
                 cmds = parse_fopts(data[8:8 + fopts_len], is_uplink)
                 if cmds:
                     result["mac_commands"] = cmds
+            # Best-effort Cayenne LPP decode of FRMPayload on private/ChirpStack
+            # uplinks (NwkID 0x00 Type 0). Skipped on other networks because
+            # FRMPayload is AES-encrypted by spec.
+            is_uplink = mtype_bits in (0b010, 0b100)
+            if (is_uplink and netid_type == 0 and nwk_id_val == 0x00
+                    and len(data) > 8 + fopts_len + 5):                # MIC(4)+FPort(1)
+                frm_start = 8 + fopts_len + 1                          # skip FPort
+                frm_end   = len(data) - 4                              # drop MIC
+                if frm_end > frm_start:
+                    sensors = parse_lpp(data[frm_start:frm_end])
+                    if sensors:
+                        result["lpp_sensors"] = sensors
         elif mtype_bits == 0b000:   # Join Request
+            # MHDR(1) + JoinEUI(8) + DevEUI(8) + DevNonce(2) + MIC(4) = 23
             if len(data) >= 19:
                 join_eui = data[1:9][::-1].hex().upper()
                 dev_eui  = data[9:17][::-1].hex().upper()
                 result["join_eui"] = join_eui
                 result["dev_eui"]  = dev_eui
+                result["join_eui_vendor"] = lookup_vendor(join_eui)
+                result["dev_eui_vendor"]  = lookup_vendor(dev_eui)
+            if len(data) >= 19:                                        # DevNonce LE
+                result["dev_nonce"] = struct.unpack_from("<H", data, 17)[0]
     except Exception:
         pass
     return result
@@ -368,7 +707,7 @@ class LoRaUnit:
         except (TypeError, ValueError):
             return None
 
-    def set_p2p_mode(self) -> bool:
+    def set_p2p_mode(self, syncword: str = LORAWAN_SYNCWORD) -> bool:
         """Switch to raw LoRa P2P mode (AT+NWM=0). Module may reboot."""
         if self.get_nwm() != 0:
             self.log.info("Switching to P2P mode...")
@@ -379,9 +718,17 @@ class LoRaUnit:
                 return False
         # Default P2P sync word (0x1234) and IQ polarity silently discard all
         # LoRaWAN frames at the SX1262 correlator before firmware sees them.
-        ok = self.cmd_ok("AT+SYNCWORD=3444")   # LoRaWAN public network sync word
+        ok = self.set_syncword(syncword)
         ok = ok and self.cmd_ok("AT+IQINVER=0") # normal IQ for uplinks (default)
         return ok
+
+    def set_syncword(self, syncword: str) -> bool:
+        """
+        Set the LoRa sync word (4 hex chars). LORAWAN_SYNCWORD for LoRaWAN
+        traffic, MESHTASTIC_SYNCWORD for Meshtastic. The default P2P sync word
+        of 0x1234 filters out everything we care about.
+        """
+        return self.cmd_ok(f"AT+SYNCWORD={syncword}")
 
     def set_iq_inversion(self, inverted: bool) -> bool:
         """Set IQ polarity. Uplinks use normal (False); RX2 downlinks use inverted (True)."""
@@ -531,6 +878,106 @@ class DeduplicationCache:
 
 
 # ---------------------------------------------------------------------------
+# Retransmission detection
+# ---------------------------------------------------------------------------
+class RetransmissionTracker:
+    """
+    Spots repeated (DevAddr, FCnt) within a short retransmit window — a sign
+    the device didn't receive an ACK and is re-sending the same confirmed
+    frame. Distinct from DeduplicationCache: that one *suppresses* repeats,
+    this one *counts* them.
+    """
+    def __init__(self, window_seconds: float = 5.0):
+        self.window = window_seconds
+        self._first_seen: dict[tuple, float] = {}
+        self._count:      dict[tuple, int]   = {}
+
+    def observe(self, dev_addr: Optional[str], fcnt: Optional[int]) -> int:
+        """Record an occurrence. Returns the retry count (0 = first sighting)."""
+        if dev_addr is None or fcnt is None:
+            return 0
+        key = (dev_addr, fcnt)
+        now = time.time()
+        first = self._first_seen.get(key)
+        if first is None or (now - first) > self.window:
+            self._first_seen[key] = now
+            self._count[key] = 0
+            return 0
+        self._count[key] += 1
+        return self._count[key]
+
+    def purge(self):
+        now = time.time()
+        self._first_seen = {k: t for k, t in self._first_seen.items()
+                            if now - t < self.window}
+        self._count = {k: v for k, v in self._count.items() if k in self._first_seen}
+
+
+# ---------------------------------------------------------------------------
+# Replay / anomaly tracker — persists across runs via a JSON sidecar.
+# Detects two LoRaWAN security smells:
+#   1. (DevEUI, DevNonce) collision → potential join-replay attack or stack reset
+#   2. FCnt that decreased or jumped back to 0 for a known DevAddr → ABP reset
+#      or DevNonce/DevAddr reuse
+# ---------------------------------------------------------------------------
+class ReplayTracker:
+    def __init__(self, state_path: Optional[str] = None):
+        self.state_path = state_path
+        # dev_eui → list[dev_nonce]
+        self.nonces: dict[str, list[int]] = defaultdict(list)
+        # dev_addr → highest FCnt seen
+        self.fcnt_max: dict[str, int] = {}
+        if state_path:
+            self._load()
+
+    def _load(self):
+        try:
+            with open(self.state_path, "r") as f:
+                state = json.load(f)
+            for dev_eui, nonces in state.get("nonces", {}).items():
+                self.nonces[dev_eui] = list(nonces)
+            self.fcnt_max = {k: int(v) for k, v in state.get("fcnt_max", {}).items()}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+
+    def save(self):
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path, "w") as f:
+                json.dump({"nonces": dict(self.nonces), "fcnt_max": self.fcnt_max},
+                          f, indent=2)
+        except OSError:
+            pass
+
+    def check_join(self, dev_eui: Optional[str], dev_nonce: Optional[int]) -> Optional[str]:
+        """Returns an alert string when DevNonce is a repeat for this DevEUI."""
+        if not dev_eui or dev_nonce is None:
+            return None
+        history = self.nonces[dev_eui]
+        alert = None
+        if dev_nonce in history:
+            alert = (f"DevNonce 0x{dev_nonce:04X} repeated for DevEUI {dev_eui} "
+                     f"(seen {history.count(dev_nonce) + 1}× total) — "
+                     f"possible replay or device reset")
+        history.append(dev_nonce)
+        return alert
+
+    def check_fcnt(self, dev_addr: Optional[str], fcnt: Optional[int]) -> Optional[str]:
+        """Returns an alert when FCnt decreased / reset for a known DevAddr."""
+        if not dev_addr or fcnt is None:
+            return None
+        prev = self.fcnt_max.get(dev_addr)
+        alert = None
+        if prev is not None and fcnt < prev:
+            alert = (f"FCnt regression for {dev_addr}: {prev} → {fcnt} "
+                     f"(device reset, ABP rejoin, or counter manipulation)")
+        if prev is None or fcnt > prev:
+            self.fcnt_max[dev_addr] = fcnt
+        return alert
+
+
+# ---------------------------------------------------------------------------
 # Output / logging
 # ---------------------------------------------------------------------------
 class OutputManager:
@@ -566,8 +1013,14 @@ class OutputManager:
             self._print_packet(pkt)
             if self._csv_writer:
                 row = asdict(pkt)
+                # Flatten list/dict fields so the CSV stays single-cell per column
                 if row.get("mac_commands"):
                     row["mac_commands"] = " | ".join(row["mac_commands"])
+                if row.get("lpp_sensors"):
+                    row["lpp_sensors"] = " | ".join(row["lpp_sensors"])
+                for k in ("beacon", "meshtastic"):
+                    if row.get(k):
+                        row[k] = json.dumps(row[k], separators=(",", ":"))
                 self._csv_writer.writerow(row)
                 self._csv_file.flush()
 
@@ -667,11 +1120,15 @@ class SweepScanner:
     def __init__(self, unit: LoRaUnit, output: OutputManager,
                  dedup: DeduplicationCache,
                  rx2_interval: int = 10,
-                 stop_event: threading.Event = None):
+                 stop_event: threading.Event = None,
+                 beacon_interval: int = 0,
+                 replay_tracker: Optional["ReplayTracker"] = None):
         self.unit = unit
         self.output = output
         self.dedup = dedup
         self.rx2_interval = rx2_interval      # check RX2 every N channel-hops
+        self.beacon_interval = beacon_interval  # 0 disables; N>0 checks every N hops
+        self.replay_tracker = replay_tracker
         self.stop_event = stop_event or threading.Event()
         self.active_combos: list[tuple[int, int]] = []
         self._hop_count = 0
@@ -692,6 +1149,9 @@ class SweepScanner:
                 self._hop_count += 1
                 if self._hop_count % self.rx2_interval == 0:
                     self._check_rx2()
+                if (self.beacon_interval > 0
+                        and self._hop_count % self.beacon_interval == 0):
+                    self._check_beacon()
         return self.active_combos
 
     def _sweep_one(self, freq: int, sf: int):
@@ -707,6 +1167,7 @@ class SweepScanner:
         packets = parse_events(lines)
         for pkt_dict in packets:
             pkt = self._make_record(pkt_dict, freq, sf, is_downlink=False)
+            self._annotate_replay(pkt)
             if not self.dedup.is_duplicate(pkt.dev_addr, pkt.fcnt):
                 self.output.record(pkt)
                 combo = (freq, sf)
@@ -729,27 +1190,95 @@ class SweepScanner:
             self.output.record(pkt)
             self.output.status("  *** GATEWAY DOWNLINK on RX2! Gateway confirmed nearby! ***")
 
+    def _check_beacon(self):
+        """Listen for a Class B beacon on 869.525 MHz / SF9 / BW125 for one slot."""
+        self.output.info(f"Beacon check: {BEACON_FREQ_EU868/1e6:.3f} MHz SF{BEACON_SF}")
+        if not self.unit.configure_p2p(BEACON_FREQ_EU868, BEACON_SF, bw=BEACON_BW):
+            return
+        # Beacons use the normal LoRaWAN public sync word and non-inverted IQ.
+        dwell = SF_DWELL.get(BEACON_SF, 5)
+        self.unit.start_rx()
+        lines = self.unit.read_async_events(dwell + 0.5)
+        self.unit.stop_rx()
+        for pkt_dict in parse_events(lines):
+            raw = pkt_dict.get("raw_hex", "")
+            if len(raw) // 2 == 17:                                    # beacon PHY length
+                pkt = self._make_record(pkt_dict, BEACON_FREQ_EU868,
+                                        BEACON_SF, is_downlink=True,
+                                        is_beacon=True)
+                self.output.record(pkt)
+                self.output.status("  ♢ CLASS B BEACON heard — gateway is time-synchronised")
+
+    def _annotate_replay(self, pkt: PacketRecord) -> None:
+        """If a ReplayTracker is wired up, set pkt.replay_alert on anomalies."""
+        if not self.replay_tracker:
+            return
+        if pkt.dev_eui and pkt.dev_nonce is not None:
+            alert = self.replay_tracker.check_join(pkt.dev_eui, pkt.dev_nonce)
+            if alert:
+                pkt.replay_alert = alert
+                self.output.status(f"  ! REPLAY ALERT: {alert}")
+        if pkt.dev_addr and pkt.fcnt is not None:
+            alert = self.replay_tracker.check_fcnt(pkt.dev_addr, pkt.fcnt)
+            if alert:
+                pkt.replay_alert = alert
+                self.output.status(f"  ! FCNT ANOMALY: {alert}")
+
     @staticmethod
-    def _make_record(pkt_dict: dict, freq: int, sf: int, is_downlink: bool) -> PacketRecord:
+    def _make_record(pkt_dict: dict, freq: int, sf: int, is_downlink: bool,
+                     bw: int = 125, is_beacon: bool = False,
+                     is_meshtastic: bool = False) -> PacketRecord:
         raw_hex = pkt_dict.get("raw_hex", "")
+        if is_meshtastic:
+            mesh = parse_meshtastic(raw_hex) if raw_hex else {}
+            return PacketRecord(
+                timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                freq=freq, sf=sf, bw=bw,
+                rssi=pkt_dict.get("rssi"),
+                snr=pkt_dict.get("snr"),
+                raw_hex=raw_hex,
+                mtype="Meshtastic",
+                is_downlink=is_downlink,
+                is_meshtastic=True,
+                meshtastic=mesh or None,
+            )
+        if is_beacon:
+            bcn = parse_beacon(raw_hex) if raw_hex else {}
+            return PacketRecord(
+                timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                freq=freq, sf=sf, bw=bw,
+                rssi=pkt_dict.get("rssi"),
+                snr=pkt_dict.get("snr"),
+                raw_hex=raw_hex,
+                mtype="Class B Beacon",
+                is_downlink=True,
+                is_beacon=True,
+                beacon=bcn or None,
+            )
         lw = parse_lorawan(raw_hex) if raw_hex else {}
         return PacketRecord(
             timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             freq=freq,
             sf=sf,
-            bw=125,
+            bw=bw,
             rssi=pkt_dict.get("rssi"),
             snr=pkt_dict.get("snr"),
             raw_hex=raw_hex,
             mtype=lw.get("mtype"),
             dev_addr=lw.get("dev_addr"),
             nwk_id=lw.get("nwk_id"),
+            netid_type=lw.get("netid_type"),
             operator=lw.get("operator_hint"),
             fcnt=lw.get("fcnt"),
             join_eui=lw.get("join_eui"),
             dev_eui=lw.get("dev_eui"),
+            dev_nonce=lw.get("dev_nonce"),
+            join_eui_vendor=lw.get("join_eui_vendor"),
+            dev_eui_vendor=lw.get("dev_eui_vendor"),
             is_downlink=is_downlink,
+            is_multicast=lw.get("is_multicast", False),
             mac_commands=lw.get("mac_commands"),
+            lpp_sensors=lw.get("lpp_sensors"),
         )
 
 
@@ -770,7 +1299,10 @@ class LockMonitor:
                  freq_hop: bool = False,
                  duration_minutes: float = 10.0,
                  rx2_interval: int = 10,
-                 stop_event: threading.Event = None):
+                 stop_event: threading.Event = None,
+                 retransmit_tracker: Optional[RetransmissionTracker] = None,
+                 replay_tracker: Optional[ReplayTracker] = None,
+                 beacon_interval: int = 0):
         if not freq_hop and freq is None:
             raise ValueError("freq is required when freq_hop=False")
         self.unit = unit
@@ -781,12 +1313,16 @@ class LockMonitor:
         self.freq_hop = freq_hop
         self.duration = duration_minutes * 60
         self.rx2_interval = rx2_interval
+        self.beacon_interval = beacon_interval
         self.stop_event = stop_event or threading.Event()
+        self.retransmit_tracker = retransmit_tracker or RetransmissionTracker()
+        self.replay_tracker = replay_tracker
         self._cycle = 0
         self.log = logging.getLogger("Lock")
 
         self._fcnt_history: dict[str, list[tuple[float, int]]] = defaultdict(list)
         self._rssi_history: dict[str, list[int]] = defaultdict(list)
+        self._retransmit_counts: dict[str, int] = defaultdict(int)
 
     def run(self):
         if self.freq_hop:
@@ -814,6 +1350,7 @@ class LockMonitor:
             self.unit.stop_rx()
             for pkt_dict in parse_events(lines):
                 pkt = SweepScanner._make_record(pkt_dict, freq, self.sf, is_downlink=False)
+                self._annotate_retransmit_and_replay(pkt)
                 if not self.dedup.is_duplicate(pkt.dev_addr, pkt.fcnt):
                     self.output.record(pkt)
                     if pkt.dev_addr:
@@ -822,10 +1359,53 @@ class LockMonitor:
                             self._fcnt_history[pkt.dev_addr].append((now, pkt.fcnt))
                         if pkt.rssi is not None:
                             self._rssi_history[pkt.dev_addr].append(pkt.rssi)
+                elif pkt.is_retransmit and pkt.dev_addr:
+                    # log retransmissions even if dedup would suppress them
+                    self.output.info(f"Retransmit #{self._retransmit_counts[pkt.dev_addr]} "
+                                     f"of {pkt.dev_addr} FCnt={pkt.fcnt}")
 
         self._cycle += 1
         if self._cycle % self.rx2_interval == 0:
             self._check_rx2()
+        if (self.beacon_interval > 0
+                and self._cycle % self.beacon_interval == 0):
+            self._check_beacon()
+
+    def _annotate_retransmit_and_replay(self, pkt: PacketRecord) -> None:
+        if pkt.dev_addr and pkt.fcnt is not None:
+            retry = self.retransmit_tracker.observe(pkt.dev_addr, pkt.fcnt)
+            if retry > 0:
+                pkt.is_retransmit = True
+                self._retransmit_counts[pkt.dev_addr] = retry
+        if not self.replay_tracker:
+            return
+        if pkt.dev_addr and pkt.fcnt is not None:
+            alert = self.replay_tracker.check_fcnt(pkt.dev_addr, pkt.fcnt)
+            if alert:
+                pkt.replay_alert = alert
+                self.output.status(f"  ! FCNT ANOMALY: {alert}")
+        if pkt.dev_eui and pkt.dev_nonce is not None:
+            alert = self.replay_tracker.check_join(pkt.dev_eui, pkt.dev_nonce)
+            if alert:
+                pkt.replay_alert = alert
+                self.output.status(f"  ! REPLAY ALERT: {alert}")
+
+    def _check_beacon(self):
+        self.output.info(f"Beacon check: {BEACON_FREQ_EU868/1e6:.3f} MHz SF{BEACON_SF}")
+        if not self.unit.configure_p2p(BEACON_FREQ_EU868, BEACON_SF, bw=BEACON_BW):
+            return
+        dwell = SF_DWELL.get(BEACON_SF, 5)
+        self.unit.start_rx()
+        lines = self.unit.read_async_events(dwell + 0.5)
+        self.unit.stop_rx()
+        for pkt_dict in parse_events(lines):
+            raw = pkt_dict.get("raw_hex", "")
+            if len(raw) // 2 == 17:
+                pkt = SweepScanner._make_record(pkt_dict, BEACON_FREQ_EU868,
+                                                BEACON_SF, is_downlink=True,
+                                                is_beacon=True)
+                self.output.record(pkt)
+                self.output.status("  ♢ CLASS B BEACON heard")
 
     def _check_rx2(self):
         self.output.info(f"RX2 interleave check: {RX2_FREQ/1e6:.3f} MHz SF{RX2_SF}")
@@ -859,6 +1439,52 @@ class LockMonitor:
                 self.output.status(
                     f"  {addr}: RSSI range {min(rssi_vals)}…{max(rssi_vals)} dBm "
                     f"(Δ{variance} dBm → {moving})")
+            retries = self._retransmit_counts.get(addr, 0)
+            if retries > 0:
+                self.output.status(
+                    f"  {addr}: {retries} retransmission(s) — no ACK received "
+                    f"or link is at the edge of coverage")
+
+
+# ---------------------------------------------------------------------------
+# Meshtastic monitor (different sync word + RF preset). Single-channel by
+# design — Meshtastic uses one fixed primary channel per region/preset.
+# ---------------------------------------------------------------------------
+class MeshtasticScanner:
+    def __init__(self, unit: LoRaUnit, output: OutputManager,
+                 preset: str = "LongFast",
+                 stop_event: threading.Event = None):
+        if preset not in MESHTASTIC_EU_PRESETS:
+            raise ValueError(f"unknown Meshtastic preset {preset!r}")
+        self.unit = unit
+        self.output = output
+        self.freq, self.sf, self.bw = MESHTASTIC_EU_PRESETS[preset]
+        self.preset = preset
+        self.stop_event = stop_event or threading.Event()
+        self.log = logging.getLogger("Meshtastic")
+
+    def run(self):
+        self.output.status(
+            f"=== MESHTASTIC MODE ({self.preset}: {self.freq/1e6:.3f} MHz "
+            f"SF{self.sf} BW{self.bw}) ===")
+        if not self.unit.set_syncword(MESHTASTIC_SYNCWORD):
+            self.output.status("WARNING: could not set Meshtastic sync word")
+        self.unit.configure_p2p(self.freq, self.sf, bw=self.bw)
+        self.unit.set_iq_inversion(False)
+        dwell = max(SF_DWELL.get(self.sf, 5), 4)
+        try:
+            while not self.stop_event.is_set():
+                self.unit.start_rx()
+                lines = self.unit.read_async_events(dwell + 0.5)
+                self.unit.stop_rx()
+                for pkt_dict in parse_events(lines):
+                    pkt = SweepScanner._make_record(
+                        pkt_dict, self.freq, self.sf, is_downlink=False,
+                        bw=self.bw, is_meshtastic=True)
+                    self.output.record(pkt)
+        finally:
+            # Restore the LoRaWAN sync word so the next module user isn't deaf
+            self.unit.set_syncword(LORAWAN_SYNCWORD)
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +1538,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Disable rich terminal output")
     p.add_argument("--dedup-window",   type=float, default=30.0,
                    help="Deduplication window in seconds")
+    p.add_argument("--beacon-interval", type=int, default=0,
+                   help="Class B beacon check interval in sweep/lock cycles (0=disabled)")
+    p.add_argument("--meshtastic",      action="store_true",
+                   help="Listen for Meshtastic traffic (sync 0x2B) on EU LongFast preset "
+                        "(869.525 MHz SF11 BW250) instead of LoRaWAN scanning")
+    p.add_argument("--meshtastic-preset", default="LongFast",
+                   choices=list(MESHTASTIC_EU_PRESETS.keys()),
+                   help="Meshtastic EU preset (freq/SF/BW)")
+    p.add_argument("--replay-state",   default=None,
+                   help="JSON sidecar to persist DevNonce/FCnt history across runs "
+                        "for replay/anomaly detection")
     return p
 
 
@@ -940,6 +1577,9 @@ def main():
         verbose=args.verbose)
 
     dedup = DeduplicationCache(window_seconds=args.dedup_window)
+    replay_tracker = (ReplayTracker(args.replay_state)
+                      if args.replay_state else None)
+    retransmit_tracker = RetransmissionTracker()
     stop_event = threading.Event()
 
     # Graceful Ctrl+C
@@ -977,14 +1617,25 @@ def main():
             print("ERROR: Could not switch to P2P mode.", file=sys.stderr)
             sys.exit(1)
 
+        # Meshtastic mode is mutually exclusive with LoRaWAN sweep/lock
+        if args.meshtastic:
+            scanner = MeshtasticScanner(
+                unit=unit, output=output,
+                preset=args.meshtastic_preset,
+                stop_event=stop_event)
+            scanner.run()
+
         # Direct lock mode (skip sweep)
-        if args.lock_freq:
+        elif args.lock_freq:
             monitor = LockMonitor(
                 unit=unit, output=output, dedup=dedup,
                 freq=args.lock_freq, sf=args.lock_sf,
                 freq_hop=args.freq_hop,
                 duration_minutes=args.lock_duration,
                 rx2_interval=args.rx2_interval,
+                beacon_interval=args.beacon_interval,
+                retransmit_tracker=retransmit_tracker,
+                replay_tracker=replay_tracker,
                 stop_event=stop_event)
             monitor.run()
 
@@ -992,6 +1643,8 @@ def main():
             scanner = SweepScanner(
                 unit=unit, output=output, dedup=dedup,
                 rx2_interval=args.rx2_interval,
+                beacon_interval=args.beacon_interval,
+                replay_tracker=replay_tracker,
                 stop_event=stop_event)
             # Run sweep passes until interrupted
             pass_num = 0
@@ -1006,6 +1659,8 @@ def main():
             scanner = SweepScanner(
                 unit=unit, output=output, dedup=dedup,
                 rx2_interval=args.rx2_interval,
+                beacon_interval=args.beacon_interval,
+                replay_tracker=replay_tracker,
                 stop_event=stop_event)
             pass_num = 0
             while not stop_event.is_set():
@@ -1021,6 +1676,9 @@ def main():
                         freq_hop=args.freq_hop,
                         duration_minutes=args.lock_duration,
                         rx2_interval=args.rx2_interval,
+                        beacon_interval=args.beacon_interval,
+                        retransmit_tracker=retransmit_tracker,
+                        replay_tracker=replay_tracker,
                         stop_event=stop_event)
                     monitor.run()
                     dedup.purge()
@@ -1036,6 +1694,8 @@ def main():
                 pass
         output.close()
         output.print_summary()
+        if replay_tracker:
+            replay_tracker.save()
 
 
 if __name__ == "__main__":
