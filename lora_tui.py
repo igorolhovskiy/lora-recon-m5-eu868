@@ -64,6 +64,10 @@ ALL_COMBOS: list[tuple[int, int]] = [
 # Positive margin means reliably decoded; ≥30 dB suggests a nearby or high-power device.
 SF_SENSITIVITY = {7: -123, 8: -126, 9: -129, 10: -132, 11: -135, 12: -137}
 
+# Each doubling of bandwidth doubles the receiver noise power, so sensitivity
+# worsens by ~3 dB per BW doubling (125→250 = +3 dB, 250→500 = +6 dB).
+_BW_SENS_ADJ = {125: 0, 250: 3, 500: 6}
+
 _EU868_CHANNEL_NAMES = {
     868100000: "EU868 CH1", 868300000: "EU868 CH2", 868500000: "EU868 CH3",
     867100000: "EU868 CH4", 867300000: "EU868 CH5", 867500000: "EU868 CH6",
@@ -119,11 +123,15 @@ def _copy_to_clipboard(text: str) -> str:
     return missing_hint
 
 
-def _link_margin(rssi: Optional[int], sf: int) -> Optional[int]:
-    """Return RSSI minus the SF sensitivity floor, or None if RSSI is unknown."""
+def _link_margin(rssi: Optional[int], sf: int, bw: int = 125) -> Optional[int]:
+    """Return RSSI minus the SF sensitivity floor, or None if RSSI is unknown.
+
+    The floor is adjusted up by 3 dB per BW doubling — important for
+    Meshtastic packets at BW=250 (and any 500 kHz traffic).
+    """
     if rssi is None:
         return None
-    return rssi - SF_SENSITIVITY[sf]
+    return rssi - (SF_SENSITIVITY[sf] + _BW_SENS_ADJ.get(bw, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +180,10 @@ def _format_packet_detail(pkt: PacketRecord,
     row("Bandwidth / CR", f"{pkt.bw} kHz / 4/5")
     row("IQ polarity", "inverted  (downlink)" if pkt.is_downlink else "normal  (uplink)")
     if pkt.rssi is not None:
-        floor = SF_SENSITIVITY[pkt.sf]
-        margin = _link_margin(pkt.rssi, pkt.sf)
-        row("RSSI", f"{pkt.rssi} dBm", f"SF{pkt.sf} sensitivity floor: {floor} dBm")
+        floor = SF_SENSITIVITY[pkt.sf] + _BW_SENS_ADJ.get(pkt.bw, 0)
+        margin = _link_margin(pkt.rssi, pkt.sf, pkt.bw)
+        bw_note = f"SF{pkt.sf} @ BW{pkt.bw} sensitivity floor: {floor} dBm"
+        row("RSSI", f"{pkt.rssi} dBm", bw_note)
         if pkt.snr is not None:
             snr_note = ("above noise floor" if pkt.snr >= 0
                         else "below noise floor — spread-spectrum FEC active")
@@ -198,18 +207,29 @@ def _format_packet_detail(pkt: PacketRecord,
             f"uses ~{duty:.3f}% of the 1% EU868 duty-cycle budget")
 
     # ── LoRaWAN Frame ────────────────────────────────────────────────────────
-    section("LORAWAN FRAME")
+    # For beacons / Meshtastic the section title is honest about the frame type,
+    # and the MHDR / Message-type / Direction rows are suppressed because those
+    # bytes don't carry LoRaWAN MAC-layer meaning. The dedicated CLASS B BEACON
+    # and MESHTASTIC HEADER sections below decode the real fields.
+    if pkt.is_beacon:
+        section("BEACON FRAME")
+    elif pkt.is_meshtastic:
+        section("MESHTASTIC FRAME")
+    else:
+        section("LORAWAN FRAME")
     row("Captured at", pkt.timestamp)
     if pkt.raw_hex:
         display_hex = pkt.raw_hex if len(pkt.raw_hex) <= 60 else pkt.raw_hex[:60] + "…"
         row("Raw hex", display_hex)
-        row("MHDR byte", f"0x{pkt.raw_hex[:2]}")
-    mtype = pkt.mtype or "unknown"
-    direction = "↓ Network → Device (via gateway)" if pkt.is_downlink else "↑ Device → Network"
-    mtype_col = ("bright_magenta" if pkt.is_downlink
-                 else ("bright_green" if "Up" in mtype else "cyan"))
-    lines.append(f"  [bold]{'Message type':<22}[/bold] [{mtype_col}]{mtype}[/{mtype_col}]")
-    row("Direction", direction)
+    if not pkt.is_beacon and not pkt.is_meshtastic:
+        if pkt.raw_hex:
+            row("MHDR byte", f"0x{pkt.raw_hex[:2]}")
+        mtype = pkt.mtype or "unknown"
+        direction = "↓ Network → Device (via gateway)" if pkt.is_downlink else "↑ Device → Network"
+        mtype_col = ("bright_magenta" if pkt.is_downlink
+                     else ("bright_green" if "Up" in mtype else "cyan"))
+        lines.append(f"  [bold]{'Message type':<22}[/bold] [{mtype_col}]{mtype}[/{mtype_col}]")
+        row("Direction", direction)
 
     if pkt.dev_addr:
         row("DevAddr", pkt.dev_addr,
@@ -234,28 +254,44 @@ def _format_packet_detail(pkt: PacketRecord,
             row("ACK flag", "ON" if ack else "OFF",
                 "acknowledging a previous confirmed frame" if ack else "")
 
-    elif pkt.join_eui or pkt.dev_eui:
-        if pkt.join_eui:
-            jvendor = pkt.join_eui_vendor or lookup_vendor(pkt.join_eui) or "—"
-            row("JoinEUI / AppEUI", pkt.join_eui,
-                "identifies the application / network server")
-            row("JoinEUI vendor", jvendor,
-                "OUI lookup of the JoinEUI prefix")
-        if pkt.dev_eui:
-            dvendor = pkt.dev_eui_vendor or lookup_vendor(pkt.dev_eui) or "—"
-            row("DevEUI", pkt.dev_eui,
-                "globally unique device ID (like a MAC address)")
-            row("DevEUI OUI", pkt.dev_eui[:6],
-                "first 3 bytes — IEEE OUI")
-            row("DevEUI vendor", dvendor,
-                "OUI lookup (curated table; longest prefix match)")
-        if pkt.dev_nonce is not None:
-            row("DevNonce", f"0x{pkt.dev_nonce:04X}",
-                "16-bit join nonce; repeats from one DevEUI are a replay smell")
-
     if pkt.is_multicast:
         row("Multicast", "yes  (DevAddr ≥ 0xFF000000)",
             "conventional FUOTA / Class C multicast range")
+
+    # ── Device Hardware (who built the radio that sent this?) ────────────────
+    # Skip this section for non-LoRaWAN frame types that don't carry these fields.
+    if not pkt.is_beacon and not pkt.is_meshtastic:
+        section("DEVICE HARDWARE")
+        if pkt.dev_eui:
+            dvendor = pkt.dev_eui_vendor or lookup_vendor(pkt.dev_eui) or "—"
+            row("DevEUI", pkt.dev_eui,
+                "IEEE EUI-64 — globally unique, like a MAC address")
+            row("OUI (first 3 bytes)", pkt.dev_eui[:6],
+                "IEEE OUI — identifies the manufacturer")
+            row("DevEUI vendor", dvendor,
+                "OUI lookup (curated local table; longest prefix match)")
+            if pkt.join_eui:
+                jvendor = pkt.join_eui_vendor or lookup_vendor(pkt.join_eui) or "—"
+                row("JoinEUI / AppEUI", pkt.join_eui,
+                    "identifies the network / application server")
+                row("JoinEUI vendor", jvendor,
+                    "OUI lookup of the JoinEUI prefix")
+            if pkt.dev_nonce is not None:
+                row("DevNonce", f"0x{pkt.dev_nonce:04X}",
+                    "16-bit join nonce; repeats from one DevEUI are a replay smell")
+        elif pkt.dev_addr:
+            # Data-frame case: the DevEUI / OUI / manufacturer aren't on the wire.
+            row("DevEUI", "— not in this frame")
+            indent = " " * 25
+            lines.append(f"{indent}[dim]Data frames carry only DevAddr (a 32-bit[/dim]")
+            lines.append(f"{indent}[dim]session ID assigned at join). DevEUI — the[/dim]")
+            lines.append(f"{indent}[dim]IEEE EUI-64 that's like a MAC address — is[/dim]")
+            lines.append(f"{indent}[dim]sent only in OTAA Join Requests and inside[/dim]")
+            lines.append(f"{indent}[dim]the encrypted FRMPayload.[/dim]")
+            row("DevEUI vendor", "unknown",
+                "no DevEUI in frame → can't look up the manufacturer")
+        else:
+            row("Device identity", "— no DevEUI or DevAddr in this frame")
 
     if pkt.replay_alert:
         section("SECURITY ALERT")
@@ -432,7 +468,7 @@ def _add_recon_notes(pkt: PacketRecord, lw: dict, lines: list[str]) -> None:
              "dim")
 
     if pkt.rssi is not None:
-        margin = _link_margin(pkt.rssi, pkt.sf)
+        margin = _link_margin(pkt.rssi, pkt.sf, pkt.bw)
         if margin is not None:
             if margin >= 20:
                 note("Very strong link margin → device is probably close "
@@ -595,6 +631,7 @@ class HardwareScanner:
                     self._do_rx(BEACON_FREQ_EU868, BEACON_SF, on_packet, dedup,
                                 is_downlink=True, bw=BEACON_BW, is_beacon=True)
             dedup.purge()
+            self.retransmit_tracker.purge()
 
     def _lock_loop(self, freq: Optional[int], sf: int, on_packet: Callable,
                    freq_hop: bool = False, on_channel: Optional[Callable] = None,
@@ -794,7 +831,7 @@ class SweepScreen(Screen):
         s["pkts"]   += 1
         s["rssi"]   = pkt.rssi
         s["snr"]    = pkt.snr
-        s["margin"] = _link_margin(pkt.rssi, pkt.sf)
+        s["margin"] = _link_margin(pkt.rssi, pkt.sf, pkt.bw)
         s["addr"]   = pkt.dev_addr or pkt.join_eui or "?"
         s["ts"]     = pkt.timestamp[11:19]  # HH:MM:SS
         self._refresh_row(combo)
@@ -1025,7 +1062,7 @@ class LockScreen(Screen):
         if pkt.is_downlink:
             flags.append("DL")
 
-        margin = _link_margin(pkt.rssi, pkt.sf)
+        margin = _link_margin(pkt.rssi, pkt.sf, pkt.bw)
         t.add_row(
             pkt.timestamp[11:19],
             str(pkt.rssi) if pkt.rssi is not None else "?",
@@ -1199,7 +1236,7 @@ class MeshtasticScreen(Screen):
         m = pkt.meshtastic or {}
         if m.get("src"):
             self._seen_nodes.add(m["src"])
-        margin = _link_margin(pkt.rssi, pkt.sf)
+        margin = _link_margin(pkt.rssi, pkt.sf, pkt.bw)
         flags = []
         if m.get("want_ack"): flags.append("ACK?")
         if m.get("via_mqtt"): flags.append("MQTT")

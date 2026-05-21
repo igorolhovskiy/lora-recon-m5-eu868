@@ -1544,6 +1544,114 @@ class TestHardwareSection:
 
 
 # ---------------------------------------------------------------------------
+# DEVICE HARDWARE section — explicit visibility into the sending device
+# ---------------------------------------------------------------------------
+class TestDeviceHardwareSection:
+    def _data_frame_pkt(self) -> PacketRecord:
+        return PacketRecord(
+            timestamp="2024-01-15T12:34:56+00:00",
+            freq=868100000, sf=9, bw=125, rssi=-90, snr=5,
+            raw_hex=_uplink_frame(0x260B1234, fcnt=10),
+            mtype="Unconfirmed Data Up",
+            dev_addr="260B1234", nwk_id="0x13", fcnt=10,
+            operator="TTN (The Things Network)",
+        )
+
+    def _join_request_pkt(self) -> PacketRecord:
+        # Dragino DevEUI A84041…
+        return PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=868100000, sf=7, bw=125, rssi=-80, snr=7,
+            raw_hex="00" + "01"*8 + "55443322114140A8" + "4200" + "AABBCCDD",
+            mtype="Join Request",
+            join_eui="0102030405060708",
+            dev_eui="A84041AABBCCDD00",
+            dev_eui_vendor="Dragino",
+            dev_nonce=0x0042,
+        )
+
+    def test_section_header_present_for_data_frame(self):
+        text = _format_packet_detail(self._data_frame_pkt())
+        assert "DEVICE HARDWARE" in text
+
+    def test_section_header_present_for_join_request(self):
+        text = _format_packet_detail(self._join_request_pkt())
+        assert "DEVICE HARDWARE" in text
+
+    def test_data_frame_says_dev_eui_not_in_this_frame(self):
+        text = _format_packet_detail(self._data_frame_pkt())
+        assert "not in this frame" in text
+        assert "Data frames carry only DevAddr" in text
+
+    def test_data_frame_vendor_marked_unknown(self):
+        text = _format_packet_detail(self._data_frame_pkt())
+        # Slice from the DEVICE HARDWARE header to the next section header
+        section = text.split("DEVICE HARDWARE", 1)[1].split("RECONNAISSANCE", 1)[0]
+        assert "unknown" in section
+        assert "can't look up the manufacturer" in section
+
+    def test_join_request_shows_full_device_identity(self):
+        text = _format_packet_detail(self._join_request_pkt())
+        section = text.split("DEVICE HARDWARE", 1)[1].split("RECONNAISSANCE", 1)[0]
+        assert "A84041AABBCCDD00" in section
+        assert "A84041" in section           # OUI
+        assert "Dragino" in section          # vendor
+        assert "0102030405060708" in section # JoinEUI
+        assert "0x0042" in section           # DevNonce
+
+    def test_section_skipped_for_meshtastic_packet(self):
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=869525000, sf=11, bw=250, rssi=-85, snr=4,
+            raw_hex="00" * 16,
+            mtype="Meshtastic",
+            is_meshtastic=True,
+            meshtastic={"src": "DEADBEEF", "dst": "FFFFFFFF",
+                        "packet_id": 0x12345678, "hop_limit": 2,
+                        "want_ack": False, "via_mqtt": False,
+                        "channel_hash": 0x08},
+        )
+        text = _format_packet_detail(pkt)
+        assert "DEVICE HARDWARE" not in text
+
+    def test_section_skipped_for_beacon_packet(self):
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=869525000, sf=9, bw=125, rssi=-100, snr=2,
+            raw_hex="00" * 17,
+            mtype="Class B Beacon",
+            is_downlink=True, is_beacon=True,
+            beacon={"utc": "2026-01-01T00:00:00+00:00",
+                    "gps_seconds": 1_400_000_000,
+                    "crc1": 0x1234, "crc2": 0xABCD,
+                    "info_desc": 1, "gw_info": "01AABBCCDDEEFF"},
+        )
+        text = _format_packet_detail(pkt)
+        assert "DEVICE HARDWARE" not in text
+
+    def test_empty_frame_shows_no_identity_row(self):
+        pkt = PacketRecord(
+            timestamp="2024-01-15T12:00:00+00:00",
+            freq=868100000, sf=7, bw=125, rssi=None, snr=None, raw_hex="",
+        )
+        text = _format_packet_detail(pkt)
+        assert "DEVICE HARDWARE" in text
+        assert "no DevEUI or DevAddr" in text
+
+    def test_section_renders_without_hardware_info_arg(self):
+        # The DEVICE HARDWARE section is for the sending device; it should
+        # appear whether or not the receiver hardware_info is supplied.
+        text_no_hw = _format_packet_detail(self._data_frame_pkt())
+        text_with_hw = _format_packet_detail(self._data_frame_pkt(),
+                                             hardware_info={"module": "test"})
+        assert "DEVICE HARDWARE" in text_no_hw
+        assert "DEVICE HARDWARE" in text_with_hw
+        # And the two sections are distinct
+        assert "RECEIVER / HARDWARE" not in text_no_hw
+        assert "RECEIVER / HARDWARE" in text_with_hw
+
+
+# ---------------------------------------------------------------------------
 # Improved Unknown-operator hint
 # ---------------------------------------------------------------------------
 class TestUnknownOperatorHint:

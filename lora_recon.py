@@ -21,7 +21,7 @@ Key commands used:
   AT+PPL=8          → preamble length
   AT+PRECV=<ms>     → open RX window; 65534 = continuous until packet or timeout
   AT+SYNCWORD=3444  → LoRaWAN public sync word (default 0x1234 drops all LoRaWAN frames)
-  AT+IQINVER=0/1   → IQ polarity: 0=normal (uplinks), 1=inverted (RX2 downlinks)
+  AT+IQINVER=0/1    → IQ polarity: 0=normal (uplinks), 1=inverted (RX2 downlinks)
 Async events (RUI3 v4.x single-line format):
   +EVT:RXP2P:<RSSI>:<SNR>:<hex payload>
   AT+RSSI=?         → last packet RSSI
@@ -615,7 +615,8 @@ def parse_lorawan(raw_hex: str) -> dict:
                     if sensors:
                         result["lpp_sensors"] = sensors
         elif mtype_bits == 0b000:   # Join Request
-            # MHDR(1) + JoinEUI(8) + DevEUI(8) + DevNonce(2) + MIC(4) = 23
+            # MHDR(1) + JoinEUI(8) + DevEUI(8) + DevNonce(2) [+ MIC(4)] = 23 on the wire;
+            # only the first 19 bytes are needed to extract identity fields.
             if len(data) >= 19:
                 join_eui = data[1:9][::-1].hex().upper()
                 dev_eui  = data[9:17][::-1].hex().upper()
@@ -623,8 +624,7 @@ def parse_lorawan(raw_hex: str) -> dict:
                 result["dev_eui"]  = dev_eui
                 result["join_eui_vendor"] = lookup_vendor(join_eui)
                 result["dev_eui_vendor"]  = lookup_vendor(dev_eui)
-            if len(data) >= 19:                                        # DevNonce LE
-                result["dev_nonce"] = struct.unpack_from("<H", data, 17)[0]
+                result["dev_nonce"] = struct.unpack_from("<H", data, 17)[0]  # LE
     except Exception:
         pass
     return result
@@ -734,14 +734,20 @@ class LoRaUnit:
         """Set IQ polarity. Uplinks use normal (False); RX2 downlinks use inverted (True)."""
         return self.cmd_ok(f"AT+IQINVER={1 if inverted else 0}")
 
+    _BW_IDX = {125: 0, 250: 1, 500: 2}
+
     def configure_p2p(self, freq: int, sf: int, bw: int = 125,
                        cr: int = 0, preamble: int = 8) -> bool:
         """Set all P2P radio parameters atomically.
 
         AT+P2P bandwidth field is an index: 0=125kHz, 1=250kHz, 2=500kHz.
+        Returns False on invalid bandwidth (rather than raising KeyError).
         """
-        _BW_IDX = {125: 0, 250: 1, 500: 2}
-        cmd = f"AT+P2P={freq}:{sf}:{_BW_IDX[bw]}:{cr}:{preamble}:14"
+        if bw not in self._BW_IDX:
+            self.log.warning(
+                f"configure_p2p: invalid bandwidth {bw} kHz (need 125/250/500)")
+            return False
+        cmd = f"AT+P2P={freq}:{sf}:{self._BW_IDX[bw]}:{cr}:{preamble}:14"
         return self.cmd_ok(cmd)
 
     def start_rx(self, window_ms: int = 65534) -> bool:
@@ -776,13 +782,16 @@ class LoRaUnit:
         """
         lines = []
         deadline = time.time() + duration
+        old_timeout = self.ser.timeout
         self.ser.timeout = 0.2
-        while time.time() < deadline:
-            line = self.ser.readline().decode(errors="replace").strip()
-            if line:
-                lines.append(line)
-                self.log.debug(f"[ASYNC] {line}")
-        self.ser.timeout = 2.0
+        try:
+            while time.time() < deadline:
+                line = self.ser.readline().decode(errors="replace").strip()
+                if line:
+                    lines.append(line)
+                    self.log.debug(f"[ASYNC] {line}")
+        finally:
+            self.ser.timeout = old_timeout
         return lines
 
 
@@ -932,7 +941,7 @@ class ReplayTracker:
 
     def _load(self):
         try:
-            with open(self.state_path, "r") as f:
+            with open(self.state_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
             for dev_eui, nonces in state.get("nonces", {}).items():
                 self.nonces[dev_eui] = list(nonces)
@@ -944,7 +953,7 @@ class ReplayTracker:
         if not self.state_path:
             return
         try:
-            with open(self.state_path, "w") as f:
+            with open(self.state_path, "w", encoding="utf-8") as f:
                 json.dump({"nonces": dict(self.nonces), "fcnt_max": self.fcnt_max},
                           f, indent=2)
         except OSError:
@@ -1002,7 +1011,7 @@ class OutputManager:
             self._rich_ok = False
 
         if self.csv_path:
-            self._csv_file = open(self.csv_path, "w", newline="")
+            self._csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
             fieldnames = list(PacketRecord.__dataclass_fields__.keys())
             self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=fieldnames)
             self._csv_writer.writeheader()
@@ -1014,10 +1023,9 @@ class OutputManager:
             if self._csv_writer:
                 row = asdict(pkt)
                 # Flatten list/dict fields so the CSV stays single-cell per column
-                if row.get("mac_commands"):
-                    row["mac_commands"] = " | ".join(row["mac_commands"])
-                if row.get("lpp_sensors"):
-                    row["lpp_sensors"] = " | ".join(row["lpp_sensors"])
+                for k in ("mac_commands", "lpp_sensors"):
+                    if row.get(k):
+                        row[k] = " | ".join(row[k])
                 for k in ("beacon", "meshtastic"):
                     if row.get(k):
                         row[k] = json.dumps(row[k], separators=(",", ":"))
@@ -1026,7 +1034,6 @@ class OutputManager:
 
     def _print_packet(self, pkt: PacketRecord):
         if self._rich_ok:
-            from rich.text import Text
             color = "bright_magenta" if pkt.is_downlink else (
                 "bright_green" if pkt.mtype and "Up" in pkt.mtype else "cyan")
             self.console.print(f"[{color}]{pkt.summary()}[/{color}]")
@@ -1048,7 +1055,7 @@ class OutputManager:
 
     def save_json(self):
         if self.json_path:
-            with open(self.json_path, "w") as f:
+            with open(self.json_path, "w", encoding="utf-8") as f:
                 json.dump([asdict(r) for r in self.records], f, indent=2)
 
     def print_summary(self):
@@ -1180,11 +1187,13 @@ class SweepScanner:
         if not self.unit.configure_p2p(RX2_FREQ, RX2_SF):
             return
         self.unit.set_iq_inversion(True)   # downlinks use inverted IQ
-        dwell = SF_DWELL[RX2_SF]
-        self.unit.start_rx()
-        lines = self.unit.read_async_events(dwell + 0.5)
-        self.unit.stop_rx()
-        self.unit.set_iq_inversion(False)  # restore normal IQ for uplinks
+        try:
+            dwell = SF_DWELL[RX2_SF]
+            self.unit.start_rx()
+            lines = self.unit.read_async_events(dwell + 0.5)
+            self.unit.stop_rx()
+        finally:
+            self.unit.set_iq_inversion(False)  # always restore even on early exit
         for pkt_dict in parse_events(lines):
             pkt = self._make_record(pkt_dict, RX2_FREQ, RX2_SF, is_downlink=True)
             self.output.record(pkt)
@@ -1210,18 +1219,25 @@ class SweepScanner:
                 self.output.status("  ♢ CLASS B BEACON heard — gateway is time-synchronised")
 
     def _annotate_replay(self, pkt: PacketRecord) -> None:
-        """If a ReplayTracker is wired up, set pkt.replay_alert on anomalies."""
+        """If a ReplayTracker is wired up, set pkt.replay_alert on anomalies.
+
+        When more than one anomaly fires for the same packet (e.g. DevNonce
+        repeat AND FCnt regression), alerts are concatenated with ' | ' so
+        nothing is silently overwritten.
+        """
         if not self.replay_tracker:
             return
         if pkt.dev_eui and pkt.dev_nonce is not None:
             alert = self.replay_tracker.check_join(pkt.dev_eui, pkt.dev_nonce)
             if alert:
-                pkt.replay_alert = alert
+                pkt.replay_alert = (
+                    f"{pkt.replay_alert} | {alert}" if pkt.replay_alert else alert)
                 self.output.status(f"  ! REPLAY ALERT: {alert}")
         if pkt.dev_addr and pkt.fcnt is not None:
             alert = self.replay_tracker.check_fcnt(pkt.dev_addr, pkt.fcnt)
             if alert:
-                pkt.replay_alert = alert
+                pkt.replay_alert = (
+                    f"{pkt.replay_alert} | {alert}" if pkt.replay_alert else alert)
                 self.output.status(f"  ! FCNT ANOMALY: {alert}")
 
     @staticmethod
@@ -1344,7 +1360,9 @@ class LockMonitor:
             if self.stop_event.is_set():
                 return
             dwell = SF_DWELL[self.sf]
-            self.unit.configure_p2p(freq, self.sf)
+            if not self.unit.configure_p2p(freq, self.sf):
+                self.log.warning(f"Failed to configure {freq} SF{self.sf}")
+                continue
             self.unit.start_rx()
             lines = self.unit.read_async_events(dwell + 0.5)
             self.unit.stop_rx()
@@ -1379,16 +1397,20 @@ class LockMonitor:
                 self._retransmit_counts[pkt.dev_addr] = retry
         if not self.replay_tracker:
             return
-        if pkt.dev_addr and pkt.fcnt is not None:
-            alert = self.replay_tracker.check_fcnt(pkt.dev_addr, pkt.fcnt)
-            if alert:
-                pkt.replay_alert = alert
-                self.output.status(f"  ! FCNT ANOMALY: {alert}")
+        # Order matches SweepScanner._annotate_replay (join first, then FCnt)
+        # so cross-class behaviour is consistent. Concatenate on multi-hit.
         if pkt.dev_eui and pkt.dev_nonce is not None:
             alert = self.replay_tracker.check_join(pkt.dev_eui, pkt.dev_nonce)
             if alert:
-                pkt.replay_alert = alert
+                pkt.replay_alert = (
+                    f"{pkt.replay_alert} | {alert}" if pkt.replay_alert else alert)
                 self.output.status(f"  ! REPLAY ALERT: {alert}")
+        if pkt.dev_addr and pkt.fcnt is not None:
+            alert = self.replay_tracker.check_fcnt(pkt.dev_addr, pkt.fcnt)
+            if alert:
+                pkt.replay_alert = (
+                    f"{pkt.replay_alert} | {alert}" if pkt.replay_alert else alert)
+                self.output.status(f"  ! FCNT ANOMALY: {alert}")
 
     def _check_beacon(self):
         self.output.info(f"Beacon check: {BEACON_FREQ_EU868/1e6:.3f} MHz SF{BEACON_SF}")
@@ -1409,13 +1431,16 @@ class LockMonitor:
 
     def _check_rx2(self):
         self.output.info(f"RX2 interleave check: {RX2_FREQ/1e6:.3f} MHz SF{RX2_SF}")
-        self.unit.configure_p2p(RX2_FREQ, RX2_SF)
+        if not self.unit.configure_p2p(RX2_FREQ, RX2_SF):
+            return
         self.unit.set_iq_inversion(True)   # downlinks use inverted IQ
-        dwell = SF_DWELL[RX2_SF]
-        self.unit.start_rx()
-        lines = self.unit.read_async_events(dwell + 0.5)
-        self.unit.stop_rx()
-        self.unit.set_iq_inversion(False)  # restore normal IQ for uplinks
+        try:
+            dwell = SF_DWELL[RX2_SF]
+            self.unit.start_rx()
+            lines = self.unit.read_async_events(dwell + 0.5)
+            self.unit.stop_rx()
+        finally:
+            self.unit.set_iq_inversion(False)  # always restore even on early exit
         for pkt_dict in parse_events(lines):
             pkt = SweepScanner._make_record(pkt_dict, RX2_FREQ, RX2_SF, is_downlink=True)
             self.output.record(pkt)
@@ -1469,8 +1494,15 @@ class MeshtasticScanner:
             f"SF{self.sf} BW{self.bw}) ===")
         if not self.unit.set_syncword(MESHTASTIC_SYNCWORD):
             self.output.status("WARNING: could not set Meshtastic sync word")
-        self.unit.configure_p2p(self.freq, self.sf, bw=self.bw)
+        if not self.unit.configure_p2p(self.freq, self.sf, bw=self.bw):
+            self.output.status(
+                f"WARNING: could not configure Meshtastic preset "
+                f"({self.preset} @ BW{self.bw}); aborting")
+            self.unit.set_syncword(LORAWAN_SYNCWORD)
+            return
         self.unit.set_iq_inversion(False)
+        # Floor dwell at 4 s — Meshtastic at high BW has short per-packet airtime
+        # but unpredictable inter-packet spacing; shorter dwell starves the loop.
         dwell = max(SF_DWELL.get(self.sf, 5), 4)
         try:
             while not self.stop_event.is_set():
@@ -1653,6 +1685,7 @@ def main():
                 output.status(f"--- Sweep pass #{pass_num} ---")
                 scanner.run()
                 dedup.purge()
+                retransmit_tracker.purge()
 
         else:
             # Full two-phase mode
@@ -1668,6 +1701,7 @@ def main():
                 output.status(f"--- Sweep pass #{pass_num} ---")
                 active = scanner.run()
                 dedup.purge()
+                retransmit_tracker.purge()
                 if active and not stop_event.is_set():
                     freq, sf = active[0]
                     monitor = LockMonitor(
@@ -1682,6 +1716,7 @@ def main():
                         stop_event=stop_event)
                     monitor.run()
                     dedup.purge()
+                    retransmit_tracker.purge()
 
     except serial.SerialException as e:
         print(f"Serial error: {e}", file=sys.stderr)
